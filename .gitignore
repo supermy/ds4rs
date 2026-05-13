@@ -1,0 +1,16 @@
+/target
+*.so
+*.o
+*.a
+*.dll
+*.dylib
+*.exe
+*.exp
+*.lib
+*.pdb
+.DS_Store
+*.swp
+*.swo
+*~
+.env
+.env.*
