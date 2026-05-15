@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2025-05-15
+
+### P0: 严重D2H热点消除
+
+- **output_proj GPU化**: 消除非BF16路径6次D2H/H2D往返，wo_a统一反量化为BF16上传GPU，使用strided batched GEMM
+- **sparse_attention**: 确保GPU内核覆盖所有配置，fallback仅作安全网
+
+### P1: 中等D2H热点消除
+
+- **gate_output GPU化**: 新增moe_expert_count_topk6_ne256内核，GPU上计算expert_counts，消除indices D2H
+- **RAM缓存Pinned Memory**: RamExpertCache改用PinnedBuffer存储，消除RAM→GPU传输的额外memcpy
+
+### P2: PCIe延迟隐藏
+
+- **双stream异步预取**: finalize_prefetch移至层计算开始前，预取与计算真正重叠
+- **SSD预取集成**: prefetch_layers_ahead中添加SSD→RAM→CPU预取链路
+
+### P3: 小优化
+
+- **RoPE GPU缓存**: RopeCache添加upload_to_gpu/get_gpu_slice，cos/sin预计算到GPU，消除~4KB H2D
+- **预取深度修正**: 基于gpu_slots/n_routed_experts计算，避免过度预取
+
+### 新增TileLang内核
+
+- `moe_expert_count_topk6_ne256`: GPU上计算expert counts
+
 ## [0.5.0] - 2025-05-15
 
 ### Phase 4: 资源优化

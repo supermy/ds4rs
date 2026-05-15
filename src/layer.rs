@@ -24,7 +24,7 @@ pub struct LayerWeights {
     pub wo_a: GpuTensor,
     pub wo_a_s: GpuTensor,
     pub wo_a_dequant: CpuTensor,
-    pub wo_a_gpu: Option<GpuTensor>,
+    pub wo_a_gpu: GpuTensor,
     pub wo_b: GpuTensor,
     pub wo_b_s: GpuTensor,
     pub q_norm: GpuTensor,
@@ -198,11 +198,7 @@ impl TransformerLayer {
             crate::quant::dequant_fp8_e4m3_to_bf16(&wo_a_host.data, &s_host.data, &wo_a_host.shape)?
         };
 
-        let wo_a_gpu = if wo_a_is_bf16 {
-            Some(GpuTensor::from_host(device.clone(), &wo_a_dequant)?)
-        } else {
-            None
-        };
+        let wo_a_gpu = GpuTensor::from_host(device.clone(), &wo_a_dequant)?;
 
         let wo_b = load_gpu(loader, &(p.clone() + "attn.wo_b.weight"))?;
         let wo_b_s = load_optional(loader, &(p.clone() + "attn.wo_b.scale"))?
@@ -285,6 +281,8 @@ impl TransformerLayer {
         rope: &RopeCache,
         input_ids: Option<&[u32]>,
     ) -> Result<GpuTensor> {
+        self.expert_scheduler.finalize_prefetch();
+
         let residual = x.clone();
 
         let (x_attn, post, comb) =
@@ -676,95 +674,27 @@ impl TransformerLayer {
         let device = o.device.clone();
         let total = bsz * seqlen;
 
-        if self.weights.wo_a_is_bf16 {
-            let o_2d = GpuTensor {
-                slice: o.slice.clone(),
-                shape: vec![total, n_groups, group_dim],
-                dtype: DType::BF16,
-                device: device.clone(),
-            };
+        let o_2d = GpuTensor {
+            slice: o.slice.clone(),
+            shape: vec![total, n_groups, group_dim],
+            dtype: DType::BF16,
+            device: device.clone(),
+        };
 
-            let wo_a_gpu = self.weights.wo_a_gpu.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("wo_a_gpu cache not initialized for bf16 path"))?;
+        let mut result = GpuTensor::zeros(device.clone(), vec![total, n_groups, o_lora_rank], DType::BF16)?;
 
-            let mut result = GpuTensor::zeros(device.clone(), vec![total, n_groups, o_lora_rank], DType::BF16)?;
+        self.cublas.gemm_bf16_nn_strided_batched(
+            o_lora_rank, group_dim, group_dim,
+            &self.weights.wo_a_gpu, &o_2d, &mut result,
+            (o_lora_rank * group_dim) as i64,
+            group_dim as i64,
+            o_lora_rank as i64,
+            (total * n_groups) as i32,
+            1.0, 0.0,
+        )?;
 
-            self.cublas.gemm_bf16_nn_strided_batched(
-                o_lora_rank, group_dim, group_dim,
-                wo_a_gpu, &o_2d, &mut result,
-                (o_lora_rank * group_dim) as i64,
-                group_dim as i64,
-                o_lora_rank as i64,
-                (total * n_groups) as i32,
-                1.0, 0.0,
-            )?;
-
-            let x = self.fp8_gemm_act_quant(&result, &self.weights.wo_b, &self.weights.wo_b_s, dim)?;
-            let x = self.reshape(&x, &[bsz, seqlen, dim])?;
-            return Ok(x);
-        }
-
-        let o_reshaped = self.reshape(o, &[bsz, seqlen, n_groups, group_dim])?;
-        let o_host = o_reshaped.to_host()?;
-        let o_bf16: &[half::bf16] = bytemuck::cast_slice(&o_host.data);
-
-        let wo_a_bf16: &[half::bf16] = bytemuck::cast_slice(&self.weights.wo_a_dequant.data);
-
-        let mut result_data = vec![0u16; bsz * seqlen * n_groups * o_lora_rank];
-
-        for g in 0..n_groups {
-            let mut x_group = vec![0u16; bsz * seqlen * group_dim];
-            for b in 0..bsz {
-                for s in 0..seqlen {
-                    let src_off = ((b * seqlen + s) * n_groups + g) * group_dim;
-                    let dst_off = (b * seqlen + s) * group_dim;
-                    for d in 0..group_dim {
-                        if src_off + d < o_bf16.len() && dst_off + d < x_group.len() {
-                            x_group[dst_off + d] = o_bf16[src_off + d].to_bits();
-                        }
-                    }
-                }
-            }
-
-            let x_cpu = CpuTensor::new(bytemuck::cast_slice(&x_group).to_vec(), vec![bsz * seqlen, group_dim], DType::BF16);
-            let x_gpu = GpuTensor::from_host(device.clone(), &x_cpu)?;
-
-            let w_shape = vec![o_lora_rank, group_dim];
-            let w_cpu = CpuTensor::new(
-                bytemuck::cast_slice(&wo_a_bf16[g * o_lora_rank * group_dim..(g + 1) * o_lora_rank * group_dim]).to_vec(),
-                w_shape,
-                DType::BF16,
-            );
-            let w_gpu = GpuTensor::from_host(device.clone(), &w_cpu)?;
-
-            let mut c_gpu = GpuTensor::zeros(device.clone(), vec![bsz * seqlen, o_lora_rank], DType::BF16)?;
-            self.cublas.gemm_bf16(bsz * seqlen, o_lora_rank, group_dim, &x_gpu, &w_gpu, &mut c_gpu, 1.0, 0.0)?;
-
-            let c_host = c_gpu.to_host()?;
-            let c_bf16: &[half::bf16] = bytemuck::cast_slice(&c_host.data);
-            for b in 0..bsz {
-                for s in 0..seqlen {
-                    let src_off = (b * seqlen + s) * o_lora_rank;
-                    let dst_off = ((b * seqlen + s) * n_groups + g) * o_lora_rank;
-                    for d in 0..o_lora_rank {
-                        if src_off + d < c_bf16.len() && dst_off + d < result_data.len() {
-                            result_data[dst_off + d] = c_bf16[src_off + d].to_bits();
-                        }
-                    }
-                }
-            }
-        }
-
-        let result_cpu = CpuTensor::new(
-            bytemuck::cast_slice(&result_data).to_vec(),
-            vec![bsz, seqlen, n_groups * o_lora_rank],
-            DType::BF16,
-        );
-        let result_gpu = GpuTensor::from_host(device.clone(), &result_cpu)?;
-
-        let x = self.fp8_gemm_act_quant(&result_gpu, &self.weights.wo_b, &self.weights.wo_b_s, dim)?;
+        let x = self.fp8_gemm_act_quant(&result, &self.weights.wo_b, &self.weights.wo_b_s, dim)?;
         let x = self.reshape(&x, &[bsz, seqlen, dim])?;
-
         Ok(x)
     }
 
@@ -805,14 +735,37 @@ impl TransformerLayer {
 
         let x_flat = self.reshape(x, &[total, dim])?;
 
-        let indices_host = gate_output.indices.to_host()?;
-        let indices_i32: &[i32] = bytemuck::cast_slice(&indices_host.data);
+        let expert_counts = {
+            let counts_gpu = GpuTensor::zeros(device.clone(), vec![n_experts], DType::INT32)?;
+            if self.kernels.call("moe_expert_count_topk6_ne256", &[&gate_output.indices, &counts_gpu]).is_ok() {
+                let counts_host = counts_gpu.to_host()?;
+                let counts_i32: &[i32] = bytemuck::cast_slice(&counts_host.data);
+                counts_i32.iter().map(|&c| c as usize).collect::<Vec<_>>()
+            } else {
+                let indices_host = gate_output.indices.to_host()?;
+                let indices_i32: &[i32] = bytemuck::cast_slice(&indices_host.data);
+                let mut counts = vec![0usize; n_experts];
+                for &idx in indices_i32 {
+                    let e = idx as usize;
+                    if e < n_experts {
+                        counts[e] += 1;
+                    }
+                }
+                counts
+            }
+        };
 
-        let mut expert_counts = vec![0usize; n_experts];
-        for &idx in indices_i32 {
-            let e = idx as usize;
-            if e < n_experts {
-                expert_counts[e] += 1;
+        let mut expert_tokens_map: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_experts];
+        {
+            let indices_host = gate_output.indices.to_host()?;
+            let indices_i32: &[i32] = bytemuck::cast_slice(&indices_host.data);
+            for t in 0..total {
+                for k in 0..topk {
+                    let e = indices_i32[t * topk + k] as usize;
+                    if e < n_experts {
+                        expert_tokens_map[e].push((t, k));
+                    }
+                }
             }
         }
 
@@ -823,15 +776,7 @@ impl TransformerLayer {
                 continue;
             }
 
-            let mut expert_tokens = Vec::new();
-            for t in 0..total {
-                for k in 0..topk {
-                    if indices_i32[t * topk + k] as usize == expert_id {
-                        expert_tokens.push((t, k));
-                    }
-                }
-            }
-
+            let expert_tokens = &expert_tokens_map[expert_id];
             if expert_tokens.is_empty() {
                 continue;
             }
@@ -1386,19 +1331,22 @@ impl TransformerLayer {
             let nope_gpu = self.slice_columns(&q_3d, 0, nope_dim)?;
             let rope_gpu = self.slice_columns(&q_3d, nope_dim, head_dim)?;
 
-            let (cos_data, sin_data) = rope.get_slice(start_pos, seqlen);
-            let mut cos_expanded = vec![0f32; total * half_rope];
-            let mut sin_expanded = vec![0f32; total * half_rope];
-            for s in 0..seqlen {
-                for k in 0..half_rope {
-                    cos_expanded[s * half_rope + k] = cos_data[s * half_rope + k];
-                    sin_expanded[s * half_rope + k] = sin_data[s * half_rope + k];
+            let (cos_gpu, sin_gpu) = if let Some((c, s)) = rope.get_gpu_slice(start_pos, seqlen) {
+                (c, s)
+            } else {
+                let (cos_data, sin_data) = rope.get_slice(start_pos, seqlen);
+                let mut cos_expanded = vec![0f32; total * half_rope];
+                let mut sin_expanded = vec![0f32; total * half_rope];
+                for s in 0..seqlen {
+                    for k in 0..half_rope {
+                        cos_expanded[s * half_rope + k] = cos_data[s * half_rope + k];
+                        sin_expanded[s * half_rope + k] = sin_data[s * half_rope + k];
+                    }
                 }
-            }
-            let cos_cpu = CpuTensor::new(bytemuck::cast_slice(&cos_expanded).to_vec(), vec![total, half_rope], DType::FP32);
-            let sin_cpu = CpuTensor::new(bytemuck::cast_slice(&sin_expanded).to_vec(), vec![total, half_rope], DType::FP32);
-            let cos_gpu = GpuTensor::from_host(device.clone(), &cos_cpu)?;
-            let sin_gpu = GpuTensor::from_host(device.clone(), &sin_cpu)?;
+                let cos_cpu = CpuTensor::new(bytemuck::cast_slice(&cos_expanded).to_vec(), vec![total, half_rope], DType::FP32);
+                let sin_cpu = CpuTensor::new(bytemuck::cast_slice(&sin_expanded).to_vec(), vec![total, half_rope], DType::FP32);
+                (GpuTensor::from_host(device.clone(), &cos_cpu)?, GpuTensor::from_host(device.clone(), &sin_cpu)?)
+            };
 
             let y_rope = GpuTensor::zeros(device.clone(), vec![total, n_heads, rope_dim], DType::BF16)?;
 

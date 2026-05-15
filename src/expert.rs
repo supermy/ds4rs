@@ -57,7 +57,11 @@ impl ExpertScheduler {
         let ssd_path = format!("{}/expert_cache", config.model_dir);
         let vram_total_mb = 16 * 1024usize;
         let vram_overhead_mb = 8 * 1024usize;
-        let max_prefetch_depth = (vram_total_mb - vram_overhead_mb) / (expert_bytes / (1024 * 1024)).max(1);
+        let max_prefetch_depth = {
+            let _expert_bytes_mb = expert_bytes / (1024 * 1024);
+            let available_slots = gpu_slots / 4;
+            (available_slots / config.n_routed_experts.max(1)).min(4).max(1)
+        };
         let prefetch_depth = 1usize;
 
         Self {
@@ -401,7 +405,7 @@ impl ExpertScheduler {
             return Ok(true);
         }
 
-        if let Some(data) = self.three_level.ram.get(layer_id, expert_id) {
+        if let Some(data) = self.three_level.ram.get_copy(layer_id, expert_id) {
             if let Ok(expert) = self.deserialize_expert(&data) {
                 self.cpu_cache.insert(key, expert);
                 return Ok(true);
@@ -534,6 +538,24 @@ impl ExpertScheduler {
             if target_layer >= self.config.num_hidden_layers {
                 break;
             }
+
+            for &eid in expert_ids {
+                if !self.cpu_cache.contains_key(&(target_layer, eid))
+                    && !self.three_level.ram.contains(target_layer, eid)
+                {
+                    if self.three_level.ssd.contains(target_layer, eid) {
+                        if let Some(data) = self.three_level.ssd.get(target_layer, eid) {
+                            if let Ok(expert) = self.deserialize_expert(&data) {
+                                self.three_level.ram.put(target_layer, eid, data);
+                                self.cpu_cache.insert((target_layer, eid), expert);
+                            }
+                        }
+                    } else {
+                        let _ = self.load_expert(target_layer, eid, loader);
+                    }
+                }
+            }
+
             self.prefetch_next_layer(target_layer.saturating_sub(1), expert_ids, loader)?;
         }
         Ok(())

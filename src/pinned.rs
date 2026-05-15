@@ -36,6 +36,14 @@ impl PinnedBuffer {
         self.ptr as u64
     }
 
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

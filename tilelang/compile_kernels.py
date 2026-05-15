@@ -1199,6 +1199,32 @@ def moe_extract_weights_kernel(topk):
 
 
 # ============================================================
+# K28: moe_expert_count_kernel (Count tokens per expert from gate indices)
+#   Eliminates D2H of gate indices for expert_counts construction
+# ============================================================
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def moe_expert_count_kernel(topk, n_experts):
+    Total = T.symbolic("Total")
+
+    @T.prim_func
+    def moe_expert_count_kernel_(
+        Indices: T.Tensor[(Total, topk), INT32],
+        Counts: T.Tensor[(n_experts,), INT32],
+    ):
+        with T.Kernel(1, threads=128) as (_):
+            for i in T.Parallel(n_experts):
+                Counts[i] = 0
+            for t in T.Serial(Total):
+                for k in T.Serial(topk):
+                    eid = Indices[t, k]
+                    if eid >= 0 and eid < n_experts:
+                        Counts[eid] = Counts[eid] + 1
+
+    return moe_expert_count_kernel_
+
+
+# ============================================================
 # Kernel instance definitions for DS-V4 Flash
 # ============================================================
 
@@ -1271,6 +1297,8 @@ KERNEL_INSTANCES = {
 
     "moe_gather_D4096": lambda: moe_gather_kernel(D=4096),
     "moe_extract_weights_topk6": lambda: moe_extract_weights_kernel(topk=6),
+
+    "moe_expert_count_topk6_ne256": lambda: moe_expert_count_kernel(topk=6, n_experts=256),
 }
 
 BATCH_A1 = [k for k in KERNEL_INSTANCES if k.startswith("act_quant_") or k.startswith("fp8_gemm_") or k.startswith("sparse_attn_") or k.startswith("hc_sinkhorn_") or k.startswith("hc_sigmoid_")]
@@ -1495,6 +1523,14 @@ def make_dummy_inputs(name):
         OutTokenIds = torch.zeros(Total, dtype=torch.int32, device=device)
         OutCount = torch.zeros(1, dtype=torch.int32, device=device)
         return [GateIndices, GateWeights, ExpertId, OutWeights, OutTokenIds, OutCount]
+    elif name.startswith("moe_expert_count_"):
+        parts = name.split("_")
+        topk = int(parts[3][4:])
+        n_experts = int(parts[4][2:])
+        Total = M
+        Indices = torch.randint(0, n_experts, (Total, topk), dtype=torch.int32, device=device)
+        Counts = torch.zeros(n_experts, dtype=torch.int32, device=device)
+        return [Indices, Counts]
     else:
         return None
 
@@ -1639,6 +1675,8 @@ def _get_func_name(name):
         return "moe_gather_kernel_"
     elif name.startswith("moe_extract_weights_"):
         return "moe_extract_weights_kernel_"
+    elif name.startswith("moe_expert_count_"):
+        return "moe_expert_count_kernel_"
     else:
         return name + "_"
 

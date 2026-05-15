@@ -1,10 +1,18 @@
 use crate::config::ModelConfig;
+use crate::dtype::DType;
+use crate::tensor::{CpuTensor, GpuTensor};
+use anyhow::Result;
+use cudarc::driver::CudaContext;
+use std::sync::Arc;
 
 pub struct RopeCache {
     pub freqs_cos: Vec<f32>,
     pub freqs_sin: Vec<f32>,
     pub seqlen: usize,
     pub dim: usize,
+    cos_gpu: Option<GpuTensor>,
+    sin_gpu: Option<GpuTensor>,
+    device: Option<Arc<CudaContext>>,
 }
 
 impl RopeCache {
@@ -57,7 +65,28 @@ impl RopeCache {
             freqs_sin: sin_data,
             seqlen,
             dim,
+            cos_gpu: None,
+            sin_gpu: None,
+            device: None,
         }
+    }
+
+    pub fn upload_to_gpu(&mut self, device: Arc<CudaContext>) -> Result<()> {
+        let half_dim = self.dim / 2;
+        let cos_cpu = CpuTensor::new(
+            bytemuck::cast_slice(&self.freqs_cos).to_vec(),
+            vec![self.seqlen, half_dim],
+            DType::FP32,
+        );
+        let sin_cpu = CpuTensor::new(
+            bytemuck::cast_slice(&self.freqs_sin).to_vec(),
+            vec![self.seqlen, half_dim],
+            DType::FP32,
+        );
+        self.cos_gpu = Some(GpuTensor::from_host(device.clone(), &cos_cpu)?);
+        self.sin_gpu = Some(GpuTensor::from_host(device.clone(), &sin_cpu)?);
+        self.device = Some(device);
+        Ok(())
     }
 
     pub fn get_slice(&self, start_pos: usize, len: usize) -> (&[f32], &[f32]) {
@@ -70,6 +99,27 @@ impl RopeCache {
             &self.freqs_cos[cos_start..cos_end],
             &self.freqs_sin[sin_start..sin_end],
         )
+    }
+
+    pub fn get_gpu_slice(&self, _start_pos: usize, len: usize) -> Option<(GpuTensor, GpuTensor)> {
+        let cos_gpu = self.cos_gpu.as_ref()?;
+        let sin_gpu = self.sin_gpu.as_ref()?;
+        let half_dim = self.dim / 2;
+        let device = self.device.as_ref()?.clone();
+
+        let cos = GpuTensor {
+            slice: cos_gpu.slice.clone(),
+            shape: vec![len, half_dim],
+            dtype: DType::FP32,
+            device: device.clone(),
+        };
+        let sin = GpuTensor {
+            slice: sin_gpu.slice.clone(),
+            shape: vec![len, half_dim],
+            dtype: DType::FP32,
+            device,
+        };
+        Some((cos, sin))
     }
 }
 

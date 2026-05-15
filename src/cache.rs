@@ -1,5 +1,6 @@
 use crate::config::ModelConfig;
 use crate::expert::ExpertWeights;
+use crate::pinned::PinnedBuffer;
 use crate::tensor::GpuTensor;
 use anyhow::{anyhow, Result};
 use cudarc::driver::CudaContext;
@@ -181,8 +182,8 @@ impl GpuExpertCache {
 }
 
 pub struct RamExpertCache {
-    hot: HashMap<(usize, usize), RamEntry>,
-    cold: HashMap<(usize, usize), RamEntry>,
+    hot: HashMap<(usize, usize), PinnedEntry>,
+    cold: HashMap<(usize, usize), PinnedEntry>,
     hot_capacity: usize,
     cold_capacity: usize,
     hot_size: usize,
@@ -192,8 +193,9 @@ pub struct RamExpertCache {
     stats: CacheHitStats,
 }
 
-struct RamEntry {
-    data: Vec<u8>,
+struct PinnedEntry {
+    buffer: PinnedBuffer,
+    len: usize,
     freq: u64,
 }
 
@@ -212,15 +214,15 @@ impl RamExpertCache {
         }
     }
 
-    pub fn get(&mut self, layer_id: usize, expert_id: usize) -> Option<Vec<u8>> {
+    pub fn get(&mut self, layer_id: usize, expert_id: usize) -> Option<&PinnedBuffer> {
         let key = (layer_id, expert_id);
         if let Some(entry) = self.hot.get_mut(&key) {
             entry.freq += 1;
             self.stats.record_hit();
-            return Some(entry.data.clone());
+            return self.hot.get(&key).map(|e| &e.buffer);
         }
         if let Some(mut entry) = self.cold.remove(&key) {
-            let size = entry.data.len();
+            let size = entry.len;
             self.cold_size -= size;
             entry.freq += 1;
             while self.hot_size + size > self.hot_capacity && !self.hot.is_empty() {
@@ -229,9 +231,24 @@ impl RamExpertCache {
             self.hot.insert(key, entry);
             self.hot_size += size;
             self.stats.record_hit();
-            return self.hot.get(&key).map(|e| e.data.clone());
+            return self.hot.get(&key).map(|e| &e.buffer);
         }
         self.stats.record_miss();
+        None
+    }
+
+    pub fn get_copy(&mut self, layer_id: usize, expert_id: usize) -> Option<Vec<u8>> {
+        let key = (layer_id, expert_id);
+        if let Some(entry) = self.hot.get(&key) {
+            let mut out = vec![0u8; entry.len];
+            unsafe { std::ptr::copy_nonoverlapping(entry.buffer.as_ptr(), out.as_mut_ptr(), entry.len); }
+            return Some(out);
+        }
+        if let Some(entry) = self.cold.get(&key) {
+            let mut out = vec![0u8; entry.len];
+            unsafe { std::ptr::copy_nonoverlapping(entry.buffer.as_ptr(), out.as_mut_ptr(), entry.len); }
+            return Some(out);
+        }
         None
     }
 
@@ -243,7 +260,15 @@ impl RamExpertCache {
             return;
         }
 
-        let entry = RamEntry { data, freq: 1 };
+        let mut buffer = match PinnedBuffer::alloc(size) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        if buffer.copy_from(&data).is_err() {
+            return;
+        }
+
+        let entry = PinnedEntry { buffer, len: size, freq: 1 };
         if self.hot_size + size <= self.hot_capacity {
             self.hot.insert(key, entry);
             self.hot_size += size;
@@ -295,7 +320,7 @@ impl RamExpertCache {
         }
         if let Some(key) = evict_key {
             if let Some(entry) = self.hot.remove(&key) {
-                let size = entry.data.len();
+                let size = entry.len;
                 self.hot_size -= size;
                 if self.cold_size + size <= self.cold_capacity {
                     self.cold.insert(key, entry);
