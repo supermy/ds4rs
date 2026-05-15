@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2025-05-15
+
+### Phase 3: MoE优化
+
+#### MoE FFN GPU化
+- **延迟D2H**: gate_output weights/indices延迟到scatter_add/CPU fallback路径才D2H，scatter_add成功路径零D2H
+- **GPU gather内核**: 新增moe_gather_D4096内核，大批量token gather在GPU完成
+- **scatter_add全GPU路径**: scatter_add成功时输出直接在GPU，无需D2H→CPU累加→H2D
+
+#### Expert权重预取优化
+- **预取逻辑重构**: 分离可变借用与不可变借用，解决借用检查器冲突
+- **SSD/RAM缓存优先**: 预取时优先从SSD/RAM缓存加载，减少磁盘I/O
+- **finalize_prefetch**: 新增方法，将预取完成的权重批量放入GPU缓存
+- **GPU缓存contains检查**: 预取跳过已在GPU缓存的专家，避免重复传输
+
+#### 新增TileLang内核
+- `moe_gather_D4096`: MoE专家输入行GPU gather
+- `moe_extract_weights_topk6`: MoE专家权重/token_id提取(预留)
+
+#### FP4 GEMM
+- 路由专家FP4权重推理路径已集成(compute_expert FP4E2M1分支)
+- 支持FP4 e2m1fn打包+FP8 e8m0fnu缩放因子
+
 ## [0.3.0] - 2025-05-15
 
 ### Phase 2: KV Cache全GPU化

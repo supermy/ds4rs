@@ -424,50 +424,76 @@ impl ExpertScheduler {
             return Ok(());
         }
 
+        let mut to_prefetch = Vec::new();
         for &eid in expert_ids {
             let key = (next_layer, eid);
-            if self.cpu_cache.contains_key(&key)
+            if self.three_level.gpu.contains(next_layer, eid)
                 || self.prefetch_pending.contains_key(&key)
-                || self.three_level.gpu.get(next_layer, eid).is_some()
             {
                 continue;
             }
 
-            if !self.three_level.ssd.contains(next_layer, eid)
-                && !self.three_level.ram.contains(next_layer, eid)
-            {
-                let _ = self.load_expert(next_layer, eid, loader);
+            if !self.cpu_cache.contains_key(&key) {
+                if self.load_from_ssd(next_layer, eid)? {
+                    // loaded from SSD/RAM cache
+                } else {
+                    let _ = self.load_expert(next_layer, eid, loader);
+                }
             }
 
-            let cpu = match self.cpu_cache.get(&key) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            if let Some(ref stream) = self.transfer_stream {
-                let weights = if self.expert_dtype == DType::FP4E2M1 {
-                    let w1 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1, self.pinned_pool.get(cpu.w1.nbytes())?, stream)?;
-                    let w1_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(cpu.w1_scale.nbytes())?, stream)?;
-                    let w3 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3, self.pinned_pool.get(cpu.w3.nbytes())?, stream)?;
-                    let w3_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(cpu.w3_scale.nbytes())?, stream)?;
-                    let w2 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2, self.pinned_pool.get(cpu.w2.nbytes())?, stream)?;
-                    let w2_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(cpu.w2_scale.nbytes())?, stream)?;
-                    ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale }
-                } else {
-                    let w1_bf16 = self.dequant_to_bf16(&cpu.w1, &cpu.w1_scale)?;
-                    let w3_bf16 = self.dequant_to_bf16(&cpu.w3, &cpu.w3_scale)?;
-                    let w2_bf16 = self.dequant_to_bf16(&cpu.w2, &cpu.w2_scale)?;
-                    let w1 = GpuTensor::from_host_pinned_async(self.device.clone(), &w1_bf16, self.pinned_pool.get(w1_bf16.nbytes())?, stream)?;
-                    let w1_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(cpu.w1_scale.nbytes())?, stream)?;
-                    let w3 = GpuTensor::from_host_pinned_async(self.device.clone(), &w3_bf16, self.pinned_pool.get(w3_bf16.nbytes())?, stream)?;
-                    let w3_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(cpu.w3_scale.nbytes())?, stream)?;
-                    let w2 = GpuTensor::from_host_pinned_async(self.device.clone(), &w2_bf16, self.pinned_pool.get(w2_bf16.nbytes())?, stream)?;
-                    let w2_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(cpu.w2_scale.nbytes())?, stream)?;
-                    ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale }
-                };
-                self.prefetch_pending.insert(key, weights);
+            if let Some(cpu) = self.cpu_cache.get(&key) {
+                to_prefetch.push((key, cpu.w1.nbytes(), cpu.w1_scale.nbytes(), cpu.w3.nbytes(), cpu.w3_scale.nbytes(), cpu.w2.nbytes(), cpu.w2_scale.nbytes()));
             }
         }
+
+        if to_prefetch.is_empty() || self.transfer_stream.is_none() {
+            return Ok(());
+        }
+
+        let stream = self.transfer_stream.as_ref().unwrap();
+        for (key, w1_sz, w1s_sz, w3_sz, w3s_sz, w2_sz, w2s_sz) in &to_prefetch {
+            let cpu = self.cpu_cache.get(key).unwrap();
+
+            let weights = if self.expert_dtype == DType::FP4E2M1 {
+                let w1 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1, self.pinned_pool.get(*w1_sz)?, stream)?;
+                let w1_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(*w1s_sz)?, stream)?;
+                let w3 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3, self.pinned_pool.get(*w3_sz)?, stream)?;
+                let w3_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(*w3s_sz)?, stream)?;
+                let w2 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2, self.pinned_pool.get(*w2_sz)?, stream)?;
+                let w2_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(*w2s_sz)?, stream)?;
+                ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale }
+            } else {
+                let w1_bf16 = self.dequant_to_bf16(&cpu.w1, &cpu.w1_scale)?;
+                let w3_bf16 = self.dequant_to_bf16(&cpu.w3, &cpu.w3_scale)?;
+                let w2_bf16 = self.dequant_to_bf16(&cpu.w2, &cpu.w2_scale)?;
+                let w1 = GpuTensor::from_host_pinned_async(self.device.clone(), &w1_bf16, self.pinned_pool.get(w1_bf16.nbytes())?, stream)?;
+                let w1_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(*w1s_sz)?, stream)?;
+                let w3 = GpuTensor::from_host_pinned_async(self.device.clone(), &w3_bf16, self.pinned_pool.get(w3_bf16.nbytes())?, stream)?;
+                let w3_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(*w3s_sz)?, stream)?;
+                let w2 = GpuTensor::from_host_pinned_async(self.device.clone(), &w2_bf16, self.pinned_pool.get(w2_bf16.nbytes())?, stream)?;
+                let w2_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(*w2s_sz)?, stream)?;
+                ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale }
+            };
+            self.prefetch_pending.insert(*key, weights);
+        }
+
         Ok(())
+    }
+
+    pub fn finalize_prefetch(&mut self) {
+        if let Some(ref stream) = self.transfer_stream {
+            stream.synchronize().ok();
+        }
+        let pending: Vec<_> = self.prefetch_pending.drain().collect();
+        for (key, weights) in pending {
+            let _ = self.three_level.gpu.put(key.0, key.1, ExpertWeights {
+                w1: weights.w1.clone(),
+                w1_scale: weights.w1_scale.clone(),
+                w3: weights.w3.clone(),
+                w3_scale: weights.w3_scale.clone(),
+                w2: weights.w2.clone(),
+                w2_scale: weights.w2_scale.clone(),
+            });
+        }
     }
 }

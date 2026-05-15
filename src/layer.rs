@@ -800,14 +800,13 @@ impl TransformerLayer {
         let shared_out = self.ffn_shared(x)?;
 
         let gate_output = self.gate.forward(x, input_ids)?;
-        let weights_host = gate_output.weights.to_host()?;
-        let indices_host = gate_output.indices.to_host()?;
-        let weights_f32: &[f32] = bytemuck::cast_slice(&weights_host.data);
-        let indices_i32: &[i32] = bytemuck::cast_slice(&indices_host.data);
 
         let mut y_gpu = shared_out;
 
         let x_flat = self.reshape(x, &[total, dim])?;
+
+        let indices_host = gate_output.indices.to_host()?;
+        let indices_i32: &[i32] = bytemuck::cast_slice(&indices_host.data);
 
         let mut expert_counts = vec![0usize; n_experts];
         for &idx in indices_i32 {
@@ -837,13 +836,36 @@ impl TransformerLayer {
                 continue;
             }
 
+            let n_tokens = expert_tokens.len();
             let row_indices: Vec<usize> = expert_tokens.iter().map(|&(t, _k)| t).collect();
-            let x_expert_gpu = x_flat.gather_rows(&row_indices, dim)?;
+
+            let x_expert_gpu = if n_tokens <= 32 {
+                x_flat.gather_rows(&row_indices, dim)?
+            } else {
+                let tid_data: Vec<i32> = row_indices.iter().map(|&t| t as i32).collect();
+                let tid_cpu = CpuTensor::new(bytemuck::cast_slice(&tid_data).to_vec(), vec![n_tokens], DType::INT32);
+                let tid_gpu = GpuTensor::from_host(device.clone(), &tid_cpu)?;
+                let x_src = GpuTensor {
+                    slice: x_flat.slice.clone(),
+                    shape: vec![total, dim],
+                    dtype: DType::BF16,
+                    device: device.clone(),
+                };
+                let x_dst = GpuTensor::zeros(device.clone(), vec![n_tokens, dim], DType::BF16)?;
+                let kernel_name = format!("moe_gather_D{}", dim);
+                if self.kernels.call(&kernel_name, &[&x_src, &tid_gpu, &x_dst]).is_ok() {
+                    x_dst
+                } else {
+                    x_flat.gather_rows(&row_indices, dim)?
+                }
+            };
 
             let expert_out = self.compute_expert(&x_expert_gpu, expert_id)?;
 
             if use_scatter_add {
-                let n_tokens = expert_tokens.len();
+                let weights_host = gate_output.weights.to_host()?;
+                let weights_f32: &[f32] = bytemuck::cast_slice(&weights_host.data);
+
                 let mut w_data = vec![0f32; n_tokens];
                 let mut tid_data = vec![0i32; n_tokens];
                 for (i, &(t, k)) in expert_tokens.iter().enumerate() {
@@ -883,6 +905,9 @@ impl TransformerLayer {
                     continue;
                 }
             }
+
+            let weights_host = gate_output.weights.to_host()?;
+            let weights_f32: &[f32] = bytemuck::cast_slice(&weights_host.data);
 
             let expert_host = expert_out.to_host()?;
             let expert_bf16: &[half::bf16] = bytemuck::cast_slice(&expert_host.data);

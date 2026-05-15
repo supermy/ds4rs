@@ -1138,6 +1138,67 @@ def compressor_group_kernel(d, out_dim, pool_size):
 
 
 # ============================================================
+# K26: moe_gather_kernel (Gather rows from source by GPU indices)
+#   For each output row i, copy src[indices[i], :] to dst[i, :]
+#   Eliminates CPU row index construction + H2D for gather
+# ============================================================
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def moe_gather_kernel(D):
+    N = T.symbolic("N")
+    M = T.symbolic("M")
+    threads = 128
+
+    @T.prim_func
+    def moe_gather_kernel_(
+        Src: T.Tensor[(M, D), BF16],
+        Indices: T.Tensor[(N,), INT32],
+        Dst: T.Tensor[(N, D), BF16],
+    ):
+        with T.Kernel(N, threads=threads) as (i,):
+            src_row = Indices[i]
+            for d in T.Parallel(D):
+                Dst[i, d] = Src[src_row, d]
+
+    return moe_gather_kernel_
+
+
+# ============================================================
+# K27: moe_extract_weights_kernel (Extract per-expert weights and token_ids from gate output)
+#   Given gate indices [total, topk] and weights [total, topk],
+#   for a specific expert_id, extract (weight, token_id) pairs
+#   where indices == expert_id.
+#   Output: out_weights[count], out_token_ids[count], count
+# ============================================================
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def moe_extract_weights_kernel(topk):
+    Total = T.symbolic("Total")
+
+    @T.prim_func
+    def moe_extract_weights_kernel_(
+        GateIndices: T.Tensor[(Total, topk), INT32],
+        GateWeights: T.Tensor[(Total, topk), FP32],
+        ExpertId: T.Tensor[(1,), INT32],
+        OutWeights: T.Tensor[(Total,), FP32],
+        OutTokenIds: T.Tensor[(Total,), INT32],
+        OutCount: T.Tensor[(1,), INT32],
+    ):
+        with T.Kernel(1, threads=1) as (_):
+            eid = ExpertId[0]
+            cnt = 0
+            for t in T.Serial(Total):
+                for k in T.Serial(topk):
+                    if GateIndices[t, k] == eid:
+                        OutWeights[cnt] = GateWeights[t, k]
+                        OutTokenIds[cnt] = T.Cast(INT32, t)
+                        cnt = cnt + 1
+            OutCount[0] = cnt
+
+    return moe_extract_weights_kernel_
+
+
+# ============================================================
 # Kernel instance definitions for DS-V4 Flash
 # ============================================================
 
@@ -1207,6 +1268,9 @@ KERNEL_INSTANCES = {
 
     "compressor_group_d128_od1024_ps8": lambda: compressor_group_kernel(d=128, out_dim=1024, pool_size=8),
     "compressor_group_d128_od1024_ps16": lambda: compressor_group_kernel(d=128, out_dim=1024, pool_size=16),
+
+    "moe_gather_D4096": lambda: moe_gather_kernel(D=4096),
+    "moe_extract_weights_topk6": lambda: moe_extract_weights_kernel(topk=6),
 }
 
 BATCH_A1 = [k for k in KERNEL_INSTANCES if k.startswith("act_quant_") or k.startswith("fp8_gemm_") or k.startswith("sparse_attn_") or k.startswith("hc_sinkhorn_") or k.startswith("hc_sigmoid_")]
@@ -1413,6 +1477,24 @@ def make_dummy_inputs(name):
         IsScore = torch.ones(1, dtype=torch.int32, device=device)
         Dst = torch.zeros(M, pool_size, d, dtype=torch.float32, device=device)
         return [Src, Ape, RowIdx, ColOff, IsScore, Dst]
+    elif name.startswith("moe_gather_"):
+        D = int(name.split("_D")[1].split("_")[0])
+        N = M
+        Total = M * 2
+        Src = torch.randn(Total, D, dtype=torch.bfloat16, device=device)
+        Indices = torch.randint(0, Total, (N,), dtype=torch.int32, device=device)
+        Dst = torch.zeros(N, D, dtype=torch.bfloat16, device=device)
+        return [Src, Indices, Dst]
+    elif name.startswith("moe_extract_weights_"):
+        topk = int(name.split("_topk")[1])
+        Total = M
+        GateIndices = torch.randint(0, 256, (Total, topk), dtype=torch.int32, device=device)
+        GateWeights = torch.randn(Total, topk, dtype=torch.float32, device=device)
+        ExpertId = torch.tensor([0], dtype=torch.int32, device=device)
+        OutWeights = torch.zeros(Total, dtype=torch.float32, device=device)
+        OutTokenIds = torch.zeros(Total, dtype=torch.int32, device=device)
+        OutCount = torch.zeros(1, dtype=torch.int32, device=device)
+        return [GateIndices, GateWeights, ExpertId, OutWeights, OutTokenIds, OutCount]
     else:
         return None
 
@@ -1553,6 +1635,10 @@ def _get_func_name(name):
         return "scale_f32_kernel_"
     elif name.startswith("compressor_group_"):
         return "compressor_group_kernel_"
+    elif name.startswith("moe_gather_"):
+        return "moe_gather_kernel_"
+    elif name.startswith("moe_extract_weights_"):
+        return "moe_extract_weights_kernel_"
     else:
         return name + "_"
 
