@@ -96,11 +96,13 @@ Indexer: Score(Q, CompressedKV) × Weights → TopK → Causal Adjust → Index
 | `cast_*` | BF16↔FP32类型转换 |
 | `indexer_score_*` | Indexer评分+TopK |
 | `indexer_causal_adjust_*` | 因果掩码+偏移调整 |
+| `compressor_group_*` | Compressor分组(gather+slice+ape) |
+| `scale_f32_*` | 元素级缩放 |
 
 ### GPU化路径
 
-- **Compressor**: Pool(GPU) → RMSNorm(GPU) → RoPE(GPU) → Hadamard(cuBLAS GEMM) → FP4-QDQ(GPU) → BF16(GPU)
-- **Indexer**: Score+TopK(GPU) → Causal Adjust(GPU) → D2D Scatter写入
+- **Compressor**: GEMM(FP32) → Group(GPU: gather+slice+ape) → Pool(GPU) → RMSNorm(GPU) → RoPE(GPU) → Hadamard(cuBLAS GEMM) → FP4-QDQ(GPU) → BF16(GPU)
+- **Indexer**: GEMM(BF16) → q_proj后处理(GPU: RoPE+Hadamard+FP4-QDQ) → Score+TopK(GPU) → Causal Adjust(GPU) → D2D Scatter写入
 - **KV Cache**: D2D行提取、环形缓冲区管理、checkpoint热启动
 - **MoE Gate**: TopK路由(GPU)
 

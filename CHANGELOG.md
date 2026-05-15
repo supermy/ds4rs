@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2025-05-15
+
+### Phase 2: KV Cache全GPU化
+
+#### Indexer全GPU路径
+- **q_proj全GPU后处理**: 新增try_gpu_q_postprocess方法，RoPE+Hadamard+FP4-QDQ全在GPU完成，消除~16MB D2H
+- **try_gpu_index_score全GPU输入**: 直接使用GPU张量(kv_cache GPU直接读取+BF16→FP32 GPU转换)，消除q_proj/weights/kv_cache_cpu的H2D上传
+- **因果掩码GPU化**: 新增indexer_causal_adjust_topk512内核，topk结果不再D2H
+- **compressed KV D2D更新**: D2D scatter成功时跳过CPU缓存同步，消除~1MB D2H
+
+#### Compressor全GPU路径
+- **GEMM结果GPU直通**: 新增compressor_group内核(gather+slice+ape add)，GEMM结果不再D2H，消除~32MB D2H+H2D往返
+- **try_gpu_pool_gpu**: 直接接受GPU张量输入，无需H2D上传
+- **ape_gpu**: APE权重上传GPU，供group内核使用
+
+#### 新增TileLang内核
+- `compressor_group_d128_od1024_ps8`: Compressor非重叠分组
+- `compressor_group_d128_od1024_ps16`: Compressor重叠分组
+- `scale_f32_N4096`: 元素级缩放
+
+#### 新增基础设施
+- `Indexer::hadamard_gpu`: q_proj Hadamard变换矩阵(GPU)
+- `Indexer::try_gpu_q_postprocess()`: q_proj全GPU后处理管道
+- `Compressor::try_gpu_group()`: GPU分组(gather+slice+ape)
+- `Compressor::try_gpu_pool_gpu()`: GPU张量直接输入pool
+
 ## [0.2.0] - 2025-05-15
 
 ### Phase 1: BUG修复 + D2H消除

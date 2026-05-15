@@ -1073,6 +1073,71 @@ def indexer_causal_adjust_kernel(topk):
 
 
 # ============================================================
+# K24: scale_f32_kernel (Element-wise scale: Y = X * scale[0])
+# ============================================================
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def scale_f32_kernel(N):
+    M = T.symbolic("M")
+    threads = 128
+
+    @T.prim_func
+    def scale_f32_kernel_(
+        X: T.Tensor[(M, N), FP32],
+        Scale: T.Tensor[(1,), FP32],
+        Y: T.Tensor[(M, N), FP32],
+    ):
+        with T.Kernel(T.ceildiv(M * N, threads), threads=threads) as (idx,):
+            for i in T.Pipelined(T.ceildiv(M * N, T.ceildiv(M * N, threads)), stride=T.ceildiv(M * N, T.ceildiv(M * N, threads))):
+                flat = idx * T.ceildiv(M * N, T.ceildiv(M * N, threads)) + i
+                if flat < M * N:
+                    row = flat // N
+                    col = flat % N
+                    Y[row, col] = X[row, col] * Scale[0]
+
+    return scale_f32_kernel_
+
+
+# ============================================================
+# K25: compressor_group_kernel (Gather+slice+ape for Compressor prefill grouping)
+#   Eliminates D2H of GEMM results by doing grouping on GPU.
+#   Takes precomputed row indices and column offsets from CPU.
+# ============================================================
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def compressor_group_kernel(d, out_dim, pool_size):
+    M = T.symbolic("M")
+    N = T.symbolic("N")
+    ratio = T.symbolic("ratio")
+    threads = 128
+
+    @T.prim_func
+    def compressor_group_kernel_(
+        Src: T.Tensor[(N, out_dim), FP32],
+        Ape: T.Tensor[(ratio, out_dim), FP32],
+        RowIdx: T.Tensor[(M, pool_size), INT32],
+        ColOff: T.Tensor[(pool_size,), INT32],
+        IsScore: T.Tensor[(1,), INT32],
+        Dst: T.Tensor[(M, pool_size, d), FP32],
+    ):
+        with T.Kernel(M, threads=threads) as (m,):
+            for r in T.Serial(pool_size):
+                row = RowIdx[m, r]
+                col = ColOff[r]
+                is_score = IsScore[0]
+                if row >= 0:
+                    for dd in T.Parallel(d):
+                        v = Src[row, col + dd]
+                        a = Ape[r % ratio, col + dd]
+                        Dst[m, r, dd] = v + a * is_score
+                else:
+                    for dd in T.Parallel(d):
+                        Dst[m, r, dd] = T.if_then_else(is_score, -1e9, 0.0)
+
+    return compressor_group_kernel_
+
+
+# ============================================================
 # Kernel instance definitions for DS-V4 Flash
 # ============================================================
 
@@ -1137,6 +1202,11 @@ KERNEL_INSTANCES = {
     "cast_f32_to_bf16_N128": lambda: cast_bf16_f32_kernel(N=128, src_dtype=FP32, dst_dtype=BF16),
 
     "indexer_causal_adjust_topk512": lambda: indexer_causal_adjust_kernel(topk=512),
+
+    "scale_f32_N4096": lambda: scale_f32_kernel(N=4096),
+
+    "compressor_group_d128_od1024_ps8": lambda: compressor_group_kernel(d=128, out_dim=1024, pool_size=8),
+    "compressor_group_d128_od1024_ps16": lambda: compressor_group_kernel(d=128, out_dim=1024, pool_size=16),
 }
 
 BATCH_A1 = [k for k in KERNEL_INSTANCES if k.startswith("act_quant_") or k.startswith("fp8_gemm_") or k.startswith("sparse_attn_") or k.startswith("hc_sinkhorn_") or k.startswith("hc_sigmoid_")]
@@ -1323,6 +1393,26 @@ def make_dummy_inputs(name):
         Offset = torch.zeros(1, dtype=torch.int32, device=device)
         Out = torch.zeros(M, topk, dtype=torch.int32, device=device)
         return [Indices, CausalLimit, Offset, Out]
+    elif name.startswith("scale_f32_"):
+        N = int(name.split("_N")[1].split("_")[0])
+        X = torch.randn(M, N, dtype=torch.float32, device=device)
+        Scale = torch.ones(1, dtype=torch.float32, device=device)
+        Y = torch.empty(M, N, dtype=torch.float32, device=device)
+        return [X, Scale, Y]
+    elif name.startswith("compressor_group_"):
+        parts = name.split("_")
+        d = int(parts[2][1:])
+        out_dim = int(parts[3][2:])
+        pool_size = int(parts[4][2:])
+        ratio = pool_size // 2 if pool_size > 8 else pool_size
+        N = M * ratio * 2
+        Src = torch.randn(N, out_dim, dtype=torch.float32, device=device)
+        Ape = torch.randn(ratio, out_dim, dtype=torch.float32, device=device)
+        RowIdx = torch.randint(0, N, (M, pool_size), dtype=torch.int32, device=device)
+        ColOff = torch.zeros(pool_size, dtype=torch.int32, device=device)
+        IsScore = torch.ones(1, dtype=torch.int32, device=device)
+        Dst = torch.zeros(M, pool_size, d, dtype=torch.float32, device=device)
+        return [Src, Ape, RowIdx, ColOff, IsScore, Dst]
     else:
         return None
 
@@ -1459,6 +1549,10 @@ def _get_func_name(name):
         return "fp4_qdq_f32_kernel_"
     elif name.startswith("indexer_causal_adjust_"):
         return "indexer_causal_adjust_kernel_"
+    elif name.startswith("scale_f32_"):
+        return "scale_f32_kernel_"
+    elif name.startswith("compressor_group_"):
+        return "compressor_group_kernel_"
     else:
         return name + "_"
 

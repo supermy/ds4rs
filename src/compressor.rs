@@ -29,6 +29,7 @@ pub struct Compressor {
     norm_cpu: Vec<f32>,
     norm_gpu: GpuTensor,
     hadamard_gpu: Option<GpuTensor>,
+    ape_gpu: GpuTensor,
     kernels: Arc<KernelRegistry>,
 }
 
@@ -108,6 +109,17 @@ impl Compressor {
             None
         };
 
+        let ape_gpu = {
+            let od = coff * head_dim;
+            let ape_rows = if od > 0 { ape_cpu.len() / od } else { 1 };
+            let at = CpuTensor::new(
+                bytemuck::cast_slice(&ape_cpu).to_vec(),
+                vec![ape_rows, od],
+                DType::FP32,
+            );
+            GpuTensor::from_host(device.clone(), &at)?
+        };
+
         Ok(Self {
             wkv,
             wgate,
@@ -127,11 +139,12 @@ impl Compressor {
             norm_cpu,
             norm_gpu,
             hadamard_gpu,
+            ape_gpu,
             kernels,
         })
     }
 
-    fn precompute_hadamard_matrix(n: usize) -> Vec<f32> {
+    pub fn precompute_hadamard_matrix(n: usize) -> Vec<f32> {
         let mut h = vec![0.0f32; n * n];
         h[0] = 1.0;
         let mut size = 1;
@@ -326,6 +339,118 @@ impl Compressor {
         Some(out_gpu)
     }
 
+    fn try_gpu_pool_gpu(
+        &self,
+        kv_gpu: &GpuTensor,
+        score_gpu: &GpuTensor,
+        pool_size: usize,
+        n_groups: usize,
+        bsz: usize,
+    ) -> Option<GpuTensor> {
+        let d = self.head_dim;
+        let kernel_name = format!("compressor_pool_d{}_c{}", d, pool_size);
+        let total = bsz * n_groups;
+
+        let out_gpu = GpuTensor::zeros(
+            self.device.clone(),
+            vec![total, d],
+            DType::FP32,
+        ).ok()?;
+
+        self.kernels.call(&kernel_name, &[kv_gpu, score_gpu, &out_gpu]).ok()?;
+
+        Some(out_gpu)
+    }
+
+    fn try_gpu_group(
+        &self,
+        src: &GpuTensor,
+        bsz: usize,
+        seqlen: usize,
+        n_groups: usize,
+        pool_size: usize,
+        is_score: bool,
+    ) -> Option<GpuTensor> {
+        let d = self.head_dim;
+        let coff = self.coff;
+        let ratio = self.compress_ratio;
+        let out_dim = coff * d;
+        let overlap = self.overlap;
+
+        let kernel_name = format!("compressor_group_d{}_od{}_ps{}", d, out_dim, pool_size);
+
+        let mut row_idx = vec![0i32; bsz * n_groups * pool_size];
+        let mut col_off = vec![0i32; pool_size];
+
+        if overlap {
+            for r in 0..ratio {
+                col_off[r] = 0;
+                col_off[ratio + r] = d as i32;
+            }
+            for b in 0..bsz {
+                for g in 0..n_groups {
+                    let base = (b * n_groups + g) * pool_size;
+                    for r in 0..ratio {
+                        if g > 0 {
+                            row_idx[base + r] = (b * seqlen + (g - 1) * ratio + r) as i32;
+                        } else {
+                            row_idx[base + r] = -1;
+                        }
+                        row_idx[base + ratio + r] = (b * seqlen + g * ratio + r) as i32;
+                    }
+                }
+            }
+        } else {
+            for r in 0..ratio {
+                col_off[r] = 0;
+            }
+            for b in 0..bsz {
+                for g in 0..n_groups {
+                    let base = (b * n_groups + g) * pool_size;
+                    for r in 0..ratio {
+                        row_idx[base + r] = (b * seqlen + g * ratio + r) as i32;
+                    }
+                }
+            }
+        }
+
+        let total = bsz * n_groups;
+        let ri_cpu = CpuTensor::new(
+            bytemuck::cast_slice(&row_idx).to_vec(),
+            vec![total, pool_size],
+            DType::INT32,
+        );
+        let ri_gpu = GpuTensor::from_host(self.device.clone(), &ri_cpu).ok()?;
+
+        let co_cpu = CpuTensor::new(
+            bytemuck::cast_slice(&col_off).to_vec(),
+            vec![pool_size],
+            DType::INT32,
+        );
+        let co_gpu = GpuTensor::from_host(self.device.clone(), &co_cpu).ok()?;
+
+        let is_score_val = if is_score { 1i32 } else { 0i32 };
+        let is_cpu = CpuTensor::new(
+            bytemuck::cast_slice(&[is_score_val]).to_vec(),
+            vec![1],
+            DType::INT32,
+        );
+        let is_gpu = GpuTensor::from_host(self.device.clone(), &is_cpu).ok()?;
+
+        let dst = GpuTensor::zeros(
+            self.device.clone(),
+            vec![total, pool_size, d],
+            DType::FP32,
+        ).ok()?;
+
+        self.kernels.call(
+            &kernel_name,
+            &[src, &self.ape_gpu, &ri_gpu, &co_gpu, &is_gpu, &dst],
+        ).ok()?;
+
+        Some(dst)
+    }
+
     fn x_to_fp32_gpu(&self, x: &GpuTensor, total: usize, dim: usize) -> Result<GpuTensor> {
         let x_2d = GpuTensor {
             slice: x.slice.clone(),
@@ -388,14 +513,6 @@ impl Compressor {
         let mut score_gpu = GpuTensor::zeros(self.device.clone(), vec![total, out_dim], DType::FP32)?;
         self.cublas.gemm_f32(total, out_dim, dim, &x_fp32, &self.wgate, &mut score_gpu, 1.0, 0.0)?;
 
-        let kv_host = kv_gpu.to_host()?;
-        let kv_proj: Vec<f32> = bytemuck::cast_slice(&kv_host.data).to_vec();
-
-        let score_host = score_gpu.to_host()?;
-        let score_proj: Vec<f32> = bytemuck::cast_slice(&score_host.data).to_vec();
-
-        let ape_f32 = &self.ape_cpu;
-
         let mut compressed = None;
 
         if start_pos == 0 {
@@ -406,153 +523,216 @@ impl Compressor {
 
             let remainder = seqlen % ratio;
             let cutoff = seqlen - remainder;
-            let offset = if overlap { ratio } else { 0 };
-
-            if overlap && cutoff >= ratio {
-                for b in 0..bsz {
-                    for r in 0..ratio {
-                        let src_t = b * seqlen + (cutoff - ratio + r);
-                        let dst_off = b * coff * ratio * coff * d + r * coff * d;
-                        for dd in 0..coff * d {
-                            self.kv_state[dst_off + dd] = kv_proj[src_t * out_dim + dd];
-                        }
-                        let ape_off = r * coff * d;
-                        for dd in 0..coff * d {
-                            let ape_val = if ape_off + dd < ape_f32.len() { ape_f32[ape_off + dd] } else { 0.0 };
-                            self.score_state[dst_off + dd] = score_proj[src_t * out_dim + dd] + ape_val;
-                        }
-                    }
-                }
-            }
-
-            let mut kv_main = Vec::new();
-            let mut score_main = Vec::new();
-            if remainder > 0 {
-                for b in 0..bsz {
-                    for t in 0..cutoff {
-                        let src_t = b * seqlen + t;
-                        for dd in 0..out_dim {
-                            kv_main.push(kv_proj[src_t * out_dim + dd]);
-                            score_main.push(score_proj[src_t * out_dim + dd]);
-                        }
-                    }
-                    for r in 0..remainder {
-                        let src_t = b * seqlen + cutoff + r;
-                        let dst_off = b * coff * ratio * coff * d + (offset + r) * coff * d;
-                        for dd in 0..coff * d {
-                            self.kv_state[dst_off + dd] = kv_proj[src_t * out_dim + dd];
-                        }
-                        let ape_off = r * coff * d;
-                        for dd in 0..coff * d {
-                            let ape_val = if ape_off + dd < ape_f32.len() { ape_f32[ape_off + dd] } else { 0.0 };
-                            self.score_state[dst_off + dd] = score_proj[src_t * out_dim + dd] + ape_val;
-                        }
-                    }
-                }
-            } else {
-                for b in 0..bsz {
-                    for t in 0..cutoff {
-                        let src_t = b * seqlen + t;
-                        for dd in 0..out_dim {
-                            kv_main.push(kv_proj[src_t * out_dim + dd]);
-                            score_main.push(score_proj[src_t * out_dim + dd]);
-                        }
-                    }
-                }
-            }
-
+            let _offset = if overlap { ratio } else { 0 };
             let n_groups = cutoff / ratio;
-            let mut kv_grouped = vec![0.0f32; bsz * n_groups * ratio * coff * d];
-            let mut score_grouped = vec![0.0f32; bsz * n_groups * ratio * coff * d];
+            let pool_size = if overlap { 2 * ratio } else { ratio };
 
-            for b in 0..bsz {
-                for g in 0..n_groups {
-                    for r in 0..ratio {
-                        let src_off = (b * cutoff + g * ratio + r) * out_dim;
-                        let dst_off = (b * n_groups + g) * ratio * coff * d + r * coff * d;
-                        for dd in 0..coff * d {
-                            kv_grouped[dst_off + dd] = kv_main[src_off + dd];
-                            let ape_off = r * coff * d;
-                            let ape_val = if ape_off + dd < ape_f32.len() { ape_f32[ape_off + dd] } else { 0.0 };
-                            score_grouped[dst_off + dd] = score_main[src_off + dd] + ape_val;
-                        }
+            let gpu_group_kv = self.try_gpu_group(&kv_gpu, bsz, seqlen, n_groups, pool_size, false);
+            let gpu_group_score = self.try_gpu_group(&score_gpu, bsz, seqlen, n_groups, pool_size, true);
+
+            if let (Some(gkv), Some(gscore)) = (&gpu_group_kv, &gpu_group_score) {
+                let result_gpu = self.try_gpu_pool_gpu(gkv, gscore, pool_size, n_groups, bsz);
+
+                if let Some(ref gpu) = result_gpu {
+                    if let Some(gpu_out) = self.try_gpu_postprocess(gpu, bsz, n_groups, start_pos, cutoff) {
+                        compressed = Some(gpu_out);
+                    } else {
+                        let host = gpu.to_host()?;
+                        let mut result: Vec<f32> = bytemuck::cast_slice(&host.data).to_vec();
+                        compressed = Some(self.cpu_postprocess_to_gpu(&mut result, bsz, n_groups, start_pos, cutoff)?);
                     }
-                }
-            }
+                } else {
+                    let gkv_host = gkv.to_host()?;
+                    let kv_grouped: Vec<f32> = bytemuck::cast_slice(&gkv_host.data).to_vec();
+                    let gscore_host = gscore.to_host()?;
+                    let score_grouped: Vec<f32> = bytemuck::cast_slice(&gscore_host.data).to_vec();
 
-            if overlap {
-                let mut kv_overlap = vec![0.0f32; bsz * n_groups * 2 * ratio * d];
-                let mut score_overlap = vec![f32::NEG_INFINITY; bsz * n_groups * 2 * ratio * d];
-
-                for b in 0..bsz {
-                    for g in 0..n_groups {
-                        for r in 0..ratio {
-                            let src_off = (b * n_groups + g) * ratio * coff * d + r * coff * d;
-                            let dst_off = (b * n_groups + g) * 2 * ratio * d + (ratio + r) * d;
+                    let mut result = vec![0.0f32; bsz * n_groups * d];
+                    for b in 0..bsz {
+                        for g in 0..n_groups {
                             for dd in 0..d {
-                                kv_overlap[dst_off + dd] = kv_grouped[src_off + d + dd];
-                                score_overlap[dst_off + dd] = score_grouped[src_off + d + dd];
-                            }
-                        }
-                        if g > 0 {
-                            for r in 0..ratio {
-                                let src_off = (b * n_groups + (g - 1)) * ratio * coff * d + r * coff * d;
-                                let dst_off = (b * n_groups + g) * 2 * ratio * d + r * d;
-                                for dd in 0..d {
-                                    kv_overlap[dst_off + dd] = kv_grouped[src_off + dd];
-                                    score_overlap[dst_off + dd] = score_grouped[src_off + dd];
+                                let mut max_s = f32::NEG_INFINITY;
+                                for r in 0..pool_size {
+                                    let idx = (b * n_groups + g) * pool_size * d + r * d + dd;
+                                    max_s = max_s.max(score_grouped[idx]);
+                                }
+                                let mut sum_exp = 0.0f32;
+                                let mut weights = vec![0.0f32; pool_size];
+                                for r in 0..pool_size {
+                                    let idx = (b * n_groups + g) * pool_size * d + r * d + dd;
+                                    weights[r] = (score_grouped[idx] - max_s).exp();
+                                    sum_exp += weights[r];
+                                }
+                                if sum_exp > 0.0 {
+                                    for w in &mut weights { *w /= sum_exp; }
+                                }
+                                let res_off = (b * n_groups + g) * d + dd;
+                                for r in 0..pool_size {
+                                    let kv_idx = (b * n_groups + g) * pool_size * d + r * d + dd;
+                                    result[res_off] += weights[r] * kv_grouped[kv_idx];
                                 }
                             }
                         }
                     }
-                }
-
-                kv_grouped = kv_overlap;
-                score_grouped = score_overlap;
-            }
-
-            let pool_size = if overlap { 2 * ratio } else { ratio };
-            let result_gpu = self.try_gpu_pool(&kv_grouped, &score_grouped, pool_size, n_groups, bsz);
-
-            if let Some(ref gpu) = result_gpu {
-                if let Some(gpu_out) = self.try_gpu_postprocess(gpu, bsz, n_groups, start_pos, cutoff) {
-                    compressed = Some(gpu_out);
-                } else {
-                    let host = gpu.to_host()?;
-                    let mut result: Vec<f32> = bytemuck::cast_slice(&host.data).to_vec();
                     compressed = Some(self.cpu_postprocess_to_gpu(&mut result, bsz, n_groups, start_pos, cutoff)?);
                 }
             } else {
-                let mut result = vec![0.0f32; bsz * n_groups * d];
-                for b in 0..bsz {
-                    for g in 0..n_groups {
-                        for dd in 0..d {
-                            let mut max_s = f32::NEG_INFINITY;
-                            for r in 0..pool_size {
-                                let idx = (b * n_groups + g) * pool_size * d + r * d + dd;
-                                max_s = max_s.max(score_grouped[idx]);
+                let kv_host = kv_gpu.to_host()?;
+                let kv_proj: Vec<f32> = bytemuck::cast_slice(&kv_host.data).to_vec();
+                let score_host = score_gpu.to_host()?;
+                let score_proj: Vec<f32> = bytemuck::cast_slice(&score_host.data).to_vec();
+                let ape_f32 = &self.ape_cpu;
+
+                if overlap && cutoff >= ratio {
+                    for b in 0..bsz {
+                        for r in 0..ratio {
+                            let src_t = b * seqlen + (cutoff - ratio + r);
+                            let dst_off = b * coff * ratio * coff * d + r * coff * d;
+                            for dd in 0..coff * d {
+                                self.kv_state[dst_off + dd] = kv_proj[src_t * out_dim + dd];
                             }
-                            let mut sum_exp = 0.0f32;
-                            let mut weights = vec![0.0f32; pool_size];
-                            for r in 0..pool_size {
-                                let idx = (b * n_groups + g) * pool_size * d + r * d + dd;
-                                weights[r] = (score_grouped[idx] - max_s).exp();
-                                sum_exp += weights[r];
-                            }
-                            if sum_exp > 0.0 {
-                                for w in &mut weights { *w /= sum_exp; }
-                            }
-                            let res_off = (b * n_groups + g) * d + dd;
-                            for r in 0..pool_size {
-                                let kv_idx = (b * n_groups + g) * pool_size * d + r * d + dd;
-                                result[res_off] += weights[r] * kv_grouped[kv_idx];
+                            let ape_off = r * coff * d;
+                            for dd in 0..coff * d {
+                                let ape_val = if ape_off + dd < ape_f32.len() { ape_f32[ape_off + dd] } else { 0.0 };
+                                self.score_state[dst_off + dd] = score_proj[src_t * out_dim + dd] + ape_val;
                             }
                         }
                     }
                 }
-                compressed = Some(self.cpu_postprocess_to_gpu(&mut result, bsz, n_groups, start_pos, cutoff)?);
+
+                let mut kv_main = Vec::new();
+                let mut score_main = Vec::new();
+                if remainder > 0 {
+                    for b in 0..bsz {
+                        for t in 0..cutoff {
+                            let src_t = b * seqlen + t;
+                            for dd in 0..out_dim {
+                                kv_main.push(kv_proj[src_t * out_dim + dd]);
+                                score_main.push(score_proj[src_t * out_dim + dd]);
+                            }
+                        }
+                        for r in 0..remainder {
+                            let src_t = b * seqlen + cutoff + r;
+                            let dst_off = b * coff * ratio * coff * d + (_offset + r) * coff * d;
+                            for dd in 0..coff * d {
+                                self.kv_state[dst_off + dd] = kv_proj[src_t * out_dim + dd];
+                            }
+                            let ape_off = r * coff * d;
+                            for dd in 0..coff * d {
+                                let ape_val = if ape_off + dd < ape_f32.len() { ape_f32[ape_off + dd] } else { 0.0 };
+                                self.score_state[dst_off + dd] = score_proj[src_t * out_dim + dd] + ape_val;
+                            }
+                        }
+                    }
+                } else {
+                    for b in 0..bsz {
+                        for t in 0..cutoff {
+                            let src_t = b * seqlen + t;
+                            for dd in 0..out_dim {
+                                kv_main.push(kv_proj[src_t * out_dim + dd]);
+                                score_main.push(score_proj[src_t * out_dim + dd]);
+                            }
+                        }
+                    }
+                }
+
+                let mut kv_grouped = vec![0.0f32; bsz * n_groups * ratio * coff * d];
+                let mut score_grouped = vec![0.0f32; bsz * n_groups * ratio * coff * d];
+
+                for b in 0..bsz {
+                    for g in 0..n_groups {
+                        for r in 0..ratio {
+                            let src_off = (b * cutoff + g * ratio + r) * out_dim;
+                            let dst_off = (b * n_groups + g) * ratio * coff * d + r * coff * d;
+                            for dd in 0..coff * d {
+                                kv_grouped[dst_off + dd] = kv_main[src_off + dd];
+                                let ape_off = r * coff * d;
+                                let ape_val = if ape_off + dd < ape_f32.len() { ape_f32[ape_off + dd] } else { 0.0 };
+                                score_grouped[dst_off + dd] = score_main[src_off + dd] + ape_val;
+                            }
+                        }
+                    }
+                }
+
+                if overlap {
+                    let mut kv_overlap = vec![0.0f32; bsz * n_groups * 2 * ratio * d];
+                    let mut score_overlap = vec![f32::NEG_INFINITY; bsz * n_groups * 2 * ratio * d];
+
+                    for b in 0..bsz {
+                        for g in 0..n_groups {
+                            for r in 0..ratio {
+                                let src_off = (b * n_groups + g) * ratio * coff * d + r * coff * d;
+                                let dst_off = (b * n_groups + g) * 2 * ratio * d + (ratio + r) * d;
+                                for dd in 0..d {
+                                    kv_overlap[dst_off + dd] = kv_grouped[src_off + d + dd];
+                                    score_overlap[dst_off + dd] = score_grouped[src_off + d + dd];
+                                }
+                            }
+                            if g > 0 {
+                                for r in 0..ratio {
+                                    let src_off = (b * n_groups + (g - 1)) * ratio * coff * d + r * coff * d;
+                                    let dst_off = (b * n_groups + g) * 2 * ratio * d + r * d;
+                                    for dd in 0..d {
+                                        kv_overlap[dst_off + dd] = kv_grouped[src_off + dd];
+                                        score_overlap[dst_off + dd] = score_grouped[src_off + dd];
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    kv_grouped = kv_overlap;
+                    score_grouped = score_overlap;
+                }
+
+                let result_gpu = self.try_gpu_pool(&kv_grouped, &score_grouped, pool_size, n_groups, bsz);
+
+                if let Some(ref gpu) = result_gpu {
+                    if let Some(gpu_out) = self.try_gpu_postprocess(gpu, bsz, n_groups, start_pos, cutoff) {
+                        compressed = Some(gpu_out);
+                    } else {
+                        let host = gpu.to_host()?;
+                        let mut result: Vec<f32> = bytemuck::cast_slice(&host.data).to_vec();
+                        compressed = Some(self.cpu_postprocess_to_gpu(&mut result, bsz, n_groups, start_pos, cutoff)?);
+                    }
+                } else {
+                    let mut result = vec![0.0f32; bsz * n_groups * d];
+                    for b in 0..bsz {
+                        for g in 0..n_groups {
+                            for dd in 0..d {
+                                let mut max_s = f32::NEG_INFINITY;
+                                for r in 0..pool_size {
+                                    let idx = (b * n_groups + g) * pool_size * d + r * d + dd;
+                                    max_s = max_s.max(score_grouped[idx]);
+                                }
+                                let mut sum_exp = 0.0f32;
+                                let mut weights = vec![0.0f32; pool_size];
+                                for r in 0..pool_size {
+                                    let idx = (b * n_groups + g) * pool_size * d + r * d + dd;
+                                    weights[r] = (score_grouped[idx] - max_s).exp();
+                                    sum_exp += weights[r];
+                                }
+                                if sum_exp > 0.0 {
+                                    for w in &mut weights { *w /= sum_exp; }
+                                }
+                                let res_off = (b * n_groups + g) * d + dd;
+                                for r in 0..pool_size {
+                                    let kv_idx = (b * n_groups + g) * pool_size * d + r * d + dd;
+                                    result[res_off] += weights[r] * kv_grouped[kv_idx];
+                                }
+                            }
+                        }
+                    }
+                    compressed = Some(self.cpu_postprocess_to_gpu(&mut result, bsz, n_groups, start_pos, cutoff)?);
+                }
             }
         } else {
+            let kv_host = kv_gpu.to_host()?;
+            let kv_proj: Vec<f32> = bytemuck::cast_slice(&kv_host.data).to_vec();
+            let score_host = score_gpu.to_host()?;
+            let score_proj: Vec<f32> = bytemuck::cast_slice(&score_host.data).to_vec();
+            let ape_f32 = &self.ape_cpu;
+
             let should_compress = (start_pos + 1) % ratio == 0;
             let pos_in_ratio = start_pos % ratio;
 
