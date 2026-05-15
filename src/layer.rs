@@ -936,7 +936,8 @@ impl TransformerLayer {
             .filter(|&e| expert_counts[e] > 0)
             .collect();
         if !active_expert_ids.is_empty() {
-            self.expert_scheduler.prefetch_next_layer(self.layer_id, &active_expert_ids, &mut self.weight_loader)?;
+            self.expert_scheduler.prefetch_layers_ahead(self.layer_id, &active_expert_ids, &mut self.weight_loader)?;
+            self.expert_scheduler.adapt();
         }
 
         Ok(y_gpu)

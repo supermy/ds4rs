@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2025-05-15
+
+### Phase 4: 资源优化
+
+#### 缓存命中率统计
+- **CacheHitStats**: 新增通用命中率统计结构(hits/misses/hit_rate/reset)
+- **GpuExpertCache**: 添加命中率统计，LFU驱逐改进为LFU+LRU(同频率时驱逐最久未访问)
+- **RamExpertCache**: 添加命中率统计，热层驱逐改为LFU(最低频率优先)
+- **SsdExpertCache**: 添加命中率统计，get()方法签名更新为&mut self
+
+#### 动态缓存调整
+- **GpuExpertCache::resize()**: 根据命中率动态调整GPU缓存slot数，min_slots下限保护
+- **RamExpertCache::rebalance()**: 动态调整热/冷层容量比例(0.2~0.6)，推理效率优先
+- **ThreeLevelCache::adapt()**: 每100次访问自适应调整，GPU命中率>90%缩容、<50%扩容
+
+#### 自适应预取策略
+- **ExpertScheduler::adapt()**: 根据GPU命中率动态调整预取深度(1~max_prefetch_depth)
+- **ExpertScheduler::prefetch_layers_ahead()**: L+N层异步预取，N根据命中率自适应
+- **ExpertScheduler::vram_utilization()**: VRAM利用率查询
+
+#### SSD L+N层预取
+- **SsdExpertCache::prefetch_layers()**: 批量MMAP预取多层专家权重
+
 ## [0.4.0] - 2025-05-15
 
 ### Phase 3: MoE优化

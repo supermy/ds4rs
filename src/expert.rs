@@ -39,6 +39,10 @@ pub struct ExpertScheduler {
     pinned_pool: PinnedPool,
     transfer_stream: Option<Arc<cudarc::driver::CudaStream>>,
     prefetch_pending: HashMap<(usize, usize), ExpertWeights>,
+    prefetch_depth: usize,
+    max_prefetch_depth: usize,
+    _vram_total_mb: usize,
+    _vram_overhead_mb: usize,
 }
 
 impl ExpertScheduler {
@@ -51,6 +55,11 @@ impl ExpertScheduler {
         let (ram_hot_mb, ram_cold_mb) = Self::compute_ram_config();
 
         let ssd_path = format!("{}/expert_cache", config.model_dir);
+        let vram_total_mb = 16 * 1024usize;
+        let vram_overhead_mb = 8 * 1024usize;
+        let max_prefetch_depth = (vram_total_mb - vram_overhead_mb) / (expert_bytes / (1024 * 1024)).max(1);
+        let prefetch_depth = 1usize;
+
         Self {
             device: device.clone(),
             inter_dim: config.moe_intermediate_size,
@@ -69,6 +78,10 @@ impl ExpertScheduler {
             pinned_pool: PinnedPool::new(expert_bytes),
             transfer_stream: device.new_stream().ok(),
             prefetch_pending: HashMap::new(),
+            prefetch_depth,
+            max_prefetch_depth: max_prefetch_depth.min(4),
+            _vram_total_mb: vram_total_mb,
+            _vram_overhead_mb: vram_overhead_mb,
         }
     }
 
@@ -495,5 +508,41 @@ impl ExpertScheduler {
                 w2_scale: weights.w2_scale.clone(),
             });
         }
+    }
+
+    pub fn adapt(&mut self) {
+        self.three_level.adapt();
+        let gpu_hit = self.three_level.gpu.hit_rate();
+        if gpu_hit > 0.85 {
+            self.prefetch_depth = 1;
+        } else if gpu_hit < 0.4 {
+            self.prefetch_depth = self.max_prefetch_depth;
+        } else {
+            self.prefetch_depth = (self.max_prefetch_depth + 1) / 2;
+        }
+    }
+
+    pub fn prefetch_layers_ahead(
+        &mut self,
+        current_layer: usize,
+        expert_ids: &[usize],
+        loader: &mut WeightLoader,
+    ) -> Result<()> {
+        let depth = self.prefetch_depth;
+        for offset in 1..=depth {
+            let target_layer = current_layer + offset;
+            if target_layer >= self.config.num_hidden_layers {
+                break;
+            }
+            self.prefetch_next_layer(target_layer.saturating_sub(1), expert_ids, loader)?;
+        }
+        Ok(())
+    }
+
+    pub fn vram_utilization(&self) -> f64 {
+        let used = self.three_level.gpu.len();
+        let total = self.three_level.gpu.max_capacity();
+        if total == 0 { return 0.0; }
+        used as f64 / total as f64
     }
 }
