@@ -14,3 +14,7 @@
 *~
 .env
 .env.*
+__pycache__/
+*.pyc
+tilelang/build/
+misc/

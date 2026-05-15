@@ -1,0 +1,23 @@
+[package]
+name = "ds4rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+dev = ["pyo3"]
+
+[dependencies]
+cudarc = { version = "0.17", features = ["cuda-12090", "cublaslt", "cublas"] }
+libloading = "0.8"
+libc = "0.2"
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+memmap2 = "0.9"
+anyhow = "1"
+pyo3 = { version = "0.23", features = ["auto-initialize"], optional = true }
+
+[dev-dependencies]
