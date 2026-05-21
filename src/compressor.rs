@@ -31,6 +31,8 @@ pub struct Compressor {
     hadamard_gpu: Option<GpuTensor>,
     ape_gpu: GpuTensor,
     kernels: Arc<KernelRegistry>,
+    kv_state_gpu: Option<GpuTensor>,
+    score_state_gpu: Option<GpuTensor>,
 }
 
 impl Compressor {
@@ -85,6 +87,15 @@ impl Compressor {
         let state_size = coff * compress_ratio * coff * head_dim;
         let kv_state = vec![0.0f32; max_batch * state_size];
         let score_state = vec![f32::NEG_INFINITY; max_batch * state_size];
+
+        let kv_state_gpu = {
+            let state_cpu = CpuTensor::new(vec![0u8; state_size * 4], vec![max_batch, state_size], DType::FP32);
+            GpuTensor::from_host(device.clone(), &state_cpu).ok()
+        };
+        let score_state_gpu = {
+            let state_cpu = CpuTensor::new(vec![0u8; state_size * 4], vec![max_batch, state_size], DType::FP32);
+            GpuTensor::from_host(device.clone(), &state_cpu).ok()
+        };
 
         let rope = RopeCache::precompute(config, config.max_position_embeddings, layer_id);
 
@@ -141,6 +152,8 @@ impl Compressor {
             hadamard_gpu,
             ape_gpu,
             kernels,
+            kv_state_gpu,
+            score_state_gpu,
         })
     }
 
@@ -180,7 +193,8 @@ impl Compressor {
         let half_rd = rd / 2;
 
         let normed = GpuTensor::zeros(self.device.clone(), vec![total, d], DType::FP32).ok()?;
-        self.kernels.call("rmsnorm_f32_weighted_N128", &[pool_gpu, &self.norm_gpu, &normed]).ok()?;
+        let norm_kernel = format!("rmsnorm_f32_weighted_N{}", d);
+        self.kernels.call(&norm_kernel, &[pool_gpu, &self.norm_gpu, &normed]).ok()?;
 
         let mut cos_data = Vec::with_capacity(total * half_rd);
         let mut sin_data = Vec::with_capacity(total * half_rd);
@@ -206,8 +220,9 @@ impl Compressor {
         let sin_gpu = GpuTensor::from_host(self.device.clone(), &sin_cpu).ok()?;
 
         let roped = GpuTensor::zeros(self.device.clone(), vec![total, d], DType::FP32).ok()?;
+        let rope_kernel = format!("compressor_rope_f32_d{}_rd{}", d, rd);
         self.kernels.call(
-            "compressor_rope_f32_d128_rd64",
+            &rope_kernel,
             &[&normed, &cos_gpu, &sin_gpu, &roped],
         ).ok()?;
 
@@ -217,7 +232,8 @@ impl Compressor {
             self.cublas.gemm_f32(total, d, d, &roped, hadamard, &mut hadamarded, 1.0, 0.0).ok()?;
 
             let qdq = GpuTensor::zeros(self.device.clone(), vec![total, d], DType::FP32).ok()?;
-            self.kernels.call("fp4_qdq_f32_N128_bs32", &[&hadamarded, &qdq]).ok()?;
+            let qdq_kernel = format!("fp4_qdq_f32_N{}_bs32", d);
+            self.kernels.call(&qdq_kernel, &[&hadamarded, &qdq]).ok()?;
             qdq
         } else {
             let host = roped.to_host().ok()?;
@@ -254,7 +270,8 @@ impl Compressor {
         };
 
         let result_bf16 = GpuTensor::zeros(self.device.clone(), vec![total, d], DType::BF16).ok()?;
-        self.kernels.call("cast_f32_to_bf16_N128", &[&quantized, &result_bf16]).ok()?;
+        let cast_kernel = format!("cast_f32_to_bf16_N{}", d);
+        self.kernels.call(&cast_kernel, &[&quantized, &result_bf16]).ok()?;
 
         Some(GpuTensor {
             slice: result_bf16.slice,
@@ -488,6 +505,133 @@ impl Compressor {
             DType::FP32,
         );
         GpuTensor::from_host(self.device.clone(), &x_fp32_cpu)
+    }
+
+    fn try_gpu_decode(
+        &mut self,
+        kv_gpu: &GpuTensor,
+        score_gpu: &GpuTensor,
+        bsz: usize,
+        start_pos: usize,
+    ) -> Option<GpuTensor> {
+        let ratio = self.compress_ratio;
+        let d = self.head_dim;
+        let coff = self.coff;
+        let overlap = self.overlap;
+        let pos_in_ratio = start_pos % ratio;
+        let should_compress = (start_pos + 1) % ratio == 0;
+        let out_dim = coff * d;
+
+        let ape_off = pos_in_ratio * coff * d;
+        let ape_nonzero = ape_off < self.ape_cpu.len() && self.ape_cpu[ape_off..ape_off + out_dim.min(self.ape_cpu.len().saturating_sub(ape_off))].iter().any(|&v| v != 0.0);
+        if ape_nonzero {
+            return None;
+        }
+
+        {
+            let kv_state = self.kv_state_gpu.as_mut()?;
+            let score_state = self.score_state_gpu.as_mut()?;
+
+            let state_off = pos_in_ratio * coff * d;
+            let dst_offset = state_off * 4;
+
+            if overlap {
+                let overlap_off = (ratio + pos_in_ratio) * coff * d;
+                let overlap_dst = overlap_off * 4;
+
+                GpuTensor::d2d_scatter_rows(
+                    kv_gpu,
+                    kv_state,
+                    out_dim * 4,
+                    coff * ratio * coff * d * 4,
+                    out_dim * 4,
+                    overlap_dst,
+                    bsz,
+                ).ok()?;
+                GpuTensor::d2d_scatter_rows(
+                    score_gpu,
+                    score_state,
+                    out_dim * 4,
+                    coff * ratio * coff * d * 4,
+                    out_dim * 4,
+                    overlap_dst,
+                    bsz,
+                ).ok()?;
+            } else {
+                GpuTensor::d2d_scatter_rows(
+                    kv_gpu,
+                    kv_state,
+                    out_dim * 4,
+                    coff * ratio * coff * d * 4,
+                    out_dim * 4,
+                    dst_offset,
+                    bsz,
+                ).ok()?;
+                GpuTensor::d2d_scatter_rows(
+                    score_gpu,
+                    score_state,
+                    out_dim * 4,
+                    coff * ratio * coff * d * 4,
+                    out_dim * 4,
+                    dst_offset,
+                    bsz,
+                ).ok()?;
+            }
+        }
+
+        if !should_compress {
+            return None;
+        }
+
+        let pool_size = if overlap { coff * ratio } else { ratio };
+        let n_groups = 1usize;
+
+        let kv_state = self.kv_state_gpu.as_ref()?;
+        let score_state = self.score_state_gpu.as_ref()?;
+
+        let pooled = self.try_gpu_pool_gpu(kv_state, score_state, pool_size, n_groups, bsz)?;
+
+        if overlap {
+            if let Some(ref mut kv_state_gpu) = self.kv_state_gpu {
+                for r in 0..ratio {
+                    let src_off = (ratio + r) * coff * d * 4;
+                    let dst_off = r * coff * d * 4;
+                    let copy_bytes = coff * d * 4;
+                    let _ = GpuTensor::d2d_copy_within(kv_state_gpu, src_off, dst_off, copy_bytes);
+                }
+            }
+            if let Some(ref mut score_state_gpu) = self.score_state_gpu {
+                for r in 0..ratio {
+                    let src_off = (ratio + r) * coff * d * 4;
+                    let dst_off = r * coff * d * 4;
+                    let copy_bytes = coff * d * 4;
+                    let _ = GpuTensor::d2d_copy_within(score_state_gpu, src_off, dst_off, copy_bytes);
+                }
+            }
+        }
+
+        self.try_gpu_postprocess(&pooled, bsz, n_groups, start_pos, start_pos + 1 - ratio)
+    }
+
+    fn sync_cpu_state_from_gpu(&mut self) {
+        if let Some(ref kv_state_gpu) = self.kv_state_gpu {
+            if let Ok(host) = kv_state_gpu.to_host() {
+                let f32_data: &[f32] = bytemuck::cast_slice(&host.data);
+                let len = f32_data.len().min(self.kv_state.len());
+                for i in 0..len {
+                    self.kv_state[i] = f32_data[i];
+                }
+            }
+        }
+        if let Some(ref score_state_gpu) = self.score_state_gpu {
+            if let Ok(host) = score_state_gpu.to_host() {
+                let f32_data: &[f32] = bytemuck::cast_slice(&host.data);
+                let len = f32_data.len().min(self.score_state.len());
+                for i in 0..len {
+                    self.score_state[i] = f32_data[i];
+                }
+            }
+        }
     }
 
     pub fn forward(
@@ -726,7 +870,33 @@ impl Compressor {
                     compressed = Some(self.cpu_postprocess_to_gpu(&mut result, bsz, n_groups, start_pos, cutoff)?);
                 }
             }
+
+            if let Some(ref mut kv_state_gpu) = self.kv_state_gpu {
+                let state_cpu = CpuTensor::new(
+                    bytemuck::cast_slice(&self.kv_state).to_vec(),
+                    kv_state_gpu.shape.clone(),
+                    DType::FP32,
+                );
+                if let Ok(new_gpu) = GpuTensor::from_host(self.device.clone(), &state_cpu) {
+                    *kv_state_gpu = new_gpu;
+                }
+            }
+            if let Some(ref mut score_state_gpu) = self.score_state_gpu {
+                let state_cpu = CpuTensor::new(
+                    bytemuck::cast_slice(&self.score_state).to_vec(),
+                    score_state_gpu.shape.clone(),
+                    DType::FP32,
+                );
+                if let Ok(new_gpu) = GpuTensor::from_host(self.device.clone(), &state_cpu) {
+                    *score_state_gpu = new_gpu;
+                }
+            }
         } else {
+            if let Some(gpu_result) = self.try_gpu_decode(&kv_gpu, &score_gpu, bsz, start_pos) {
+                self.sync_cpu_state_from_gpu();
+                return Ok(Some(gpu_result));
+            }
+
             let kv_host = kv_gpu.to_host()?;
             let kv_proj: Vec<f32> = bytemuck::cast_slice(&kv_host.data).to_vec();
             let score_host = score_gpu.to_host()?;
@@ -874,6 +1044,27 @@ impl Compressor {
                         );
                         compressed = Some(GpuTensor::from_host(self.device.clone(), &cpu)?);
                     }
+                }
+            }
+
+            if let Some(ref mut kv_state_gpu) = self.kv_state_gpu {
+                let state_cpu = CpuTensor::new(
+                    bytemuck::cast_slice(&self.kv_state).to_vec(),
+                    kv_state_gpu.shape.clone(),
+                    DType::FP32,
+                );
+                if let Ok(new_gpu) = GpuTensor::from_host(self.device.clone(), &state_cpu) {
+                    *kv_state_gpu = new_gpu;
+                }
+            }
+            if let Some(ref mut score_state_gpu) = self.score_state_gpu {
+                let state_cpu = CpuTensor::new(
+                    bytemuck::cast_slice(&self.score_state).to_vec(),
+                    score_state_gpu.shape.clone(),
+                    DType::FP32,
+                );
+                if let Ok(new_gpu) = GpuTensor::from_host(self.device.clone(), &state_cpu) {
+                    *score_state_gpu = new_gpu;
                 }
             }
         }

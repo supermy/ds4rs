@@ -1,7 +1,7 @@
 use crate::cache::ThreeLevelCache;
 use crate::config::ModelConfig;
 use crate::dtype::DType;
-use crate::pinned::PinnedPool;
+use crate::pinned::{PinnedBuffer, PinnedPool};
 use crate::quant::{dequant_fp4_e2m1_to_bf16, dequant_fp8_e4m3_to_bf16};
 use crate::tensor::{CpuTensor, GpuTensor};
 use crate::weight::WeightLoader;
@@ -38,11 +38,28 @@ pub struct ExpertScheduler {
     three_level: ThreeLevelCache,
     pinned_pool: PinnedPool,
     transfer_stream: Option<Arc<cudarc::driver::CudaStream>>,
-    prefetch_pending: HashMap<(usize, usize), ExpertWeights>,
+    prefetch_pending: HashMap<(usize, usize), Arc<ExpertWeights>>,
+    prefetch_pinned: Vec<PinnedBuffer>,
     prefetch_depth: usize,
     max_prefetch_depth: usize,
     _vram_total_mb: usize,
     _vram_overhead_mb: usize,
+    gpu_slots: GpuWeightSlots,
+}
+
+struct GpuWeightSlots {
+    w1: Arc<cudarc::driver::CudaSlice<u8>>,
+    w1_scale: Arc<cudarc::driver::CudaSlice<u8>>,
+    w3: Arc<cudarc::driver::CudaSlice<u8>>,
+    w3_scale: Arc<cudarc::driver::CudaSlice<u8>>,
+    w2: Arc<cudarc::driver::CudaSlice<u8>>,
+    w2_scale: Arc<cudarc::driver::CudaSlice<u8>>,
+    w1_shape: Vec<usize>,
+    w1_scale_shape: Vec<usize>,
+    w3_shape: Vec<usize>,
+    w3_scale_shape: Vec<usize>,
+    w2_shape: Vec<usize>,
+    w2_scale_shape: Vec<usize>,
 }
 
 impl ExpertScheduler {
@@ -64,6 +81,51 @@ impl ExpertScheduler {
         };
         let prefetch_depth = 1usize;
 
+        let gpu_slots = {
+            let stream = device.default_stream();
+            let is_fp4 = expert_dtype == DType::FP4E2M1;
+            let s_inter_dim = config.moe_intermediate_size;
+            let s_dim = config.hidden_size;
+            let w1_rows = s_inter_dim;
+            let w1_cols_packed = if is_fp4 { s_dim / 2 } else { s_dim };
+            let w1_scale_cols = if is_fp4 { s_dim / 32 } else { 0 };
+            let w2_rows = s_dim;
+            let w2_cols_packed = if is_fp4 { s_inter_dim / 2 } else { s_inter_dim };
+            let w2_scale_cols = if is_fp4 { s_inter_dim / 32 } else { 0 };
+
+            let w1_nbytes = w1_rows * w1_cols_packed;
+            let w1_s_nbytes = w1_rows * w1_scale_cols;
+            let w3_nbytes = w1_rows * w1_cols_packed;
+            let w3_s_nbytes = w1_rows * w1_scale_cols;
+            let w2_nbytes = w2_rows * w2_cols_packed;
+            let w2_s_nbytes = w2_rows * w2_scale_cols;
+
+            macro_rules! alloc_slot {
+                ($nbytes:expr) => {
+                    if $nbytes > 0 {
+                        Arc::new(stream.alloc_zeros::<u8>($nbytes).expect("GPU slot alloc"))
+                    } else {
+                        Arc::new(stream.alloc_zeros::<u8>(1).expect("GPU slot alloc min"))
+                    }
+                };
+            }
+
+            GpuWeightSlots {
+                w1: alloc_slot!(w1_nbytes),
+                w1_scale: alloc_slot!(w1_s_nbytes),
+                w3: alloc_slot!(w3_nbytes),
+                w3_scale: alloc_slot!(w3_s_nbytes),
+                w2: alloc_slot!(w2_nbytes),
+                w2_scale: alloc_slot!(w2_s_nbytes),
+                w1_shape: vec![w1_rows, w1_cols_packed],
+                w1_scale_shape: vec![w1_rows, w1_scale_cols.max(1)],
+                w3_shape: vec![w1_rows, w1_cols_packed],
+                w3_scale_shape: vec![w1_rows, w1_scale_cols.max(1)],
+                w2_shape: vec![w2_rows, w2_cols_packed],
+                w2_scale_shape: vec![w2_rows, w2_scale_cols.max(1)],
+            }
+        };
+
         Self {
             device: device.clone(),
             inter_dim: config.moe_intermediate_size,
@@ -74,7 +136,7 @@ impl ExpertScheduler {
             three_level: ThreeLevelCache::new(
                 device.clone(),
                 config,
-                gpu_slots,
+                0,
                 ram_hot_mb,
                 ram_cold_mb,
                 &ssd_path,
@@ -82,10 +144,12 @@ impl ExpertScheduler {
             pinned_pool: PinnedPool::new(expert_bytes),
             transfer_stream: device.new_stream().ok(),
             prefetch_pending: HashMap::new(),
+            prefetch_pinned: Vec::new(),
             prefetch_depth,
             max_prefetch_depth: max_prefetch_depth.min(4),
             _vram_total_mb: vram_total_mb,
             _vram_overhead_mb: vram_overhead_mb,
+            gpu_slots,
         }
     }
 
@@ -98,7 +162,7 @@ impl ExpertScheduler {
         let w3 = w1;
         let w2 = inter * dim / (if is_fp4 { 2 } else { 1 }) * bytes_per_elem;
         let scale_elems = if is_fp4 {
-            (dim / 32) * (inter / 128 + inter / 128) + (inter / 32) * (dim / 128)
+            2 * dim * inter / 32 + inter * dim / 32
         } else {
             0
         };
@@ -107,18 +171,20 @@ impl ExpertScheduler {
 
     fn compute_gpu_slots(_config: &ModelConfig, expert_bytes: usize) -> usize {
         let total_vram_mb: usize = 16 * 1024;
-        let static_overhead_mb: usize = 3 * 1024;
-        let kv_cache_mb: usize = 5 * 1024;
-        let available_mb = total_vram_mb.saturating_sub(static_overhead_mb + kv_cache_mb);
+        let static_overhead_mb: usize = 11 * 1024;
+        let kv_cache_mb: usize = 1 * 1024;
+        let inference_overhead_mb: usize = 2 * 1024;
+        let available_mb = total_vram_mb.saturating_sub(static_overhead_mb + kv_cache_mb + inference_overhead_mb);
         let expert_mb = (expert_bytes + 512 * 1024 - 1) / (1024 * 1024);
         if expert_mb == 0 { return 8; }
         let slots = available_mb / expert_mb.max(1);
-        slots.max(8).min(512)
+        slots.max(8).min(64)
     }
 
     fn compute_ram_config() -> (usize, usize) {
-        let total_ram_mb: usize = 96 * 1024;
-        let system_overhead_mb: usize = 8 * 1024;
+        // 96GB 物理内存，按 90GB 使用，预留 6GB 给系统
+        let total_ram_mb: usize = 90 * 1024;
+        let system_overhead_mb: usize = 6 * 1024;
         let model_weights_mb: usize = 10 * 1024;
         let available_mb = total_ram_mb.saturating_sub(system_overhead_mb + model_weights_mb);
         let hot_mb = (available_mb as f64 * 0.3) as usize;
@@ -141,6 +207,7 @@ impl ExpertScheduler {
 
         let w1 = loader.load(&(p.clone() + "w1.weight"))
             .with_context(|| format!("expert {}/{} w1", layer_id, expert_id))?;
+        let w1 = self.fix_fp4_dtype(w1);
         let w1_scale = if loader.contains(&(p.clone() + "w1.scale")) {
             loader.load(&(p.clone() + "w1.scale"))?
         } else {
@@ -148,6 +215,7 @@ impl ExpertScheduler {
         };
         let w3 = loader.load(&(p.clone() + "w3.weight"))
             .with_context(|| format!("expert {}/{} w3", layer_id, expert_id))?;
+        let w3 = self.fix_fp4_dtype(w3);
         let w3_scale = if loader.contains(&(p.clone() + "w3.scale")) {
             loader.load(&(p.clone() + "w3.scale"))?
         } else {
@@ -155,6 +223,7 @@ impl ExpertScheduler {
         };
         let w2 = loader.load(&(p.clone() + "w2.weight"))
             .with_context(|| format!("expert {}/{} w2", layer_id, expert_id))?;
+        let w2 = self.fix_fp4_dtype(w2);
         let w2_scale = if loader.contains(&(p.clone() + "w2.scale")) {
             loader.load(&(p.clone() + "w2.scale"))?
         } else {
@@ -179,106 +248,72 @@ impl ExpertScheduler {
         &mut self,
         layer_id: usize,
         expert_id: usize,
-    ) -> Result<ExpertWeights> {
+        raw: bool,
+    ) -> Result<Arc<ExpertWeights>> {
         let key = (layer_id, expert_id);
 
         if let Some(weights) = self.three_level.gpu.get(layer_id, expert_id) {
-            return Ok(weights);
+            if !raw && weights.w1.dtype == DType::FP4E2M1 {
+                self.three_level.gpu.evict(layer_id, expert_id);
+            } else {
+                return Ok(weights);
+            }
         }
 
         if let Some(weights) = self.prefetch_pending.remove(&key) {
             if let Some(ref stream) = self.transfer_stream {
                 stream.synchronize().ok();
             }
-            let _ = self.three_level.gpu.put(layer_id, expert_id, ExpertWeights {
-                w1: weights.w1.clone(),
-                w1_scale: weights.w1_scale.clone(),
-                w3: weights.w3.clone(),
-                w3_scale: weights.w3_scale.clone(),
-                w2: weights.w2.clone(),
-                w2_scale: weights.w2_scale.clone(),
-            });
+            let _ = self.three_level.gpu.put(layer_id, expert_id, Arc::clone(&weights));
             return Ok(weights);
         }
 
-        let cpu = self.cpu_cache.get(&key)
-            .ok_or_else(|| anyhow!("expert {}/{} not loaded in CPU cache", layer_id, expert_id))?;
-
-        let w1_bf16 = self.dequant_to_bf16(&cpu.w1, &cpu.w1_scale)?;
-        let w3_bf16 = self.dequant_to_bf16(&cpu.w3, &cpu.w3_scale)?;
-        let w2_bf16 = self.dequant_to_bf16(&cpu.w2, &cpu.w2_scale)?;
-
-        let w1 = GpuTensor::from_host_pinned(self.device.clone(), &w1_bf16, self.pinned_pool.get(w1_bf16.nbytes())?)?;
-        let w1_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(cpu.w1_scale.nbytes())?)?;
-        let w3 = GpuTensor::from_host_pinned(self.device.clone(), &w3_bf16, self.pinned_pool.get(w3_bf16.nbytes())?)?;
-        let w3_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(cpu.w3_scale.nbytes())?)?;
-        let w2 = GpuTensor::from_host_pinned(self.device.clone(), &w2_bf16, self.pinned_pool.get(w2_bf16.nbytes())?)?;
-        let w2_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(cpu.w2_scale.nbytes())?)?;
-
-        let weights = ExpertWeights {
-            w1, w1_scale, w3, w3_scale, w2, w2_scale,
-        };
-
-        let _ = self.three_level.gpu.put(layer_id, expert_id, ExpertWeights {
-            w1: weights.w1.clone(),
-            w1_scale: weights.w1_scale.clone(),
-            w3: weights.w3.clone(),
-            w3_scale: weights.w3_scale.clone(),
-            w2: weights.w2.clone(),
-            w2_scale: weights.w2_scale.clone(),
-        });
-
-        Ok(weights)
-    }
-
-    pub fn get_expert_gpu_raw(
-        &mut self,
-        layer_id: usize,
-        expert_id: usize,
-    ) -> Result<ExpertWeights> {
-        let key = (layer_id, expert_id);
-
-        if let Some(weights) = self.three_level.gpu.get(layer_id, expert_id) {
-            return Ok(weights);
-        }
-
-        if let Some(weights) = self.prefetch_pending.remove(&key) {
-            if let Some(ref stream) = self.transfer_stream {
-                stream.synchronize().ok();
+        let cpu = match self.cpu_cache.get(&key) {
+            Some(c) => c,
+            None => {
+                if self.load_from_ssd(layer_id, expert_id)? {
+                    self.cpu_cache.get(&key)
+                        .ok_or_else(|| anyhow!("expert {}/{} loaded but missing from CPU cache", layer_id, expert_id))?
+                } else {
+                    return Err(anyhow!("expert {}/{} not found in any cache", layer_id, expert_id));
+                }
             }
-            let _ = self.three_level.gpu.put(layer_id, expert_id, ExpertWeights {
-                w1: weights.w1.clone(),
-                w1_scale: weights.w1_scale.clone(),
-                w3: weights.w3.clone(),
-                w3_scale: weights.w3_scale.clone(),
-                w2: weights.w2.clone(),
-                w2_scale: weights.w2_scale.clone(),
-            });
-            return Ok(weights);
-        }
-
-        let cpu = self.cpu_cache.get(&key)
-            .ok_or_else(|| anyhow!("expert {}/{} not loaded in CPU cache", layer_id, expert_id))?;
-
-        let w1 = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w1, self.pinned_pool.get(cpu.w1.nbytes())?)?;
-        let w1_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(cpu.w1_scale.nbytes())?)?;
-        let w3 = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w3, self.pinned_pool.get(cpu.w3.nbytes())?)?;
-        let w3_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(cpu.w3_scale.nbytes())?)?;
-        let w2 = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w2, self.pinned_pool.get(cpu.w2.nbytes())?)?;
-        let w2_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(cpu.w2_scale.nbytes())?)?;
-
-        let weights = ExpertWeights {
-            w1, w1_scale, w3, w3_scale, w2, w2_scale,
         };
 
-        let _ = self.three_level.gpu.put(layer_id, expert_id, ExpertWeights {
-            w1: weights.w1.clone(),
-            w1_scale: weights.w1_scale.clone(),
-            w3: weights.w3.clone(),
-            w3_scale: weights.w3_scale.clone(),
-            w2: weights.w2.clone(),
-            w2_scale: weights.w2_scale.clone(),
-        });
+        let weights = if raw && self.expert_dtype == DType::FP4E2M1 {
+            let mut b1 = self.pinned_pool.get(cpu.w1.nbytes())?;
+            let w1 = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w1, &mut b1)?;
+            let mut b2 = self.pinned_pool.get(cpu.w1_scale.nbytes())?;
+            let w1_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w1_scale, &mut b2)?;
+            let mut b3 = self.pinned_pool.get(cpu.w3.nbytes())?;
+            let w3 = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w3, &mut b3)?;
+            let mut b4 = self.pinned_pool.get(cpu.w3_scale.nbytes())?;
+            let w3_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w3_scale, &mut b4)?;
+            let mut b5 = self.pinned_pool.get(cpu.w2.nbytes())?;
+            let w2 = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w2, &mut b5)?;
+            let mut b6 = self.pinned_pool.get(cpu.w2_scale.nbytes())?;
+            let w2_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w2_scale, &mut b6)?;
+            Arc::new(ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale })
+        } else {
+            let w1_bf16 = self.dequant_to_bf16(&cpu.w1, &cpu.w1_scale)?;
+            let w3_bf16 = self.dequant_to_bf16(&cpu.w3, &cpu.w3_scale)?;
+            let w2_bf16 = self.dequant_to_bf16(&cpu.w2, &cpu.w2_scale)?;
+            let mut b1 = self.pinned_pool.get(w1_bf16.nbytes())?;
+            let w1 = GpuTensor::from_host_pinned(self.device.clone(), &w1_bf16, &mut b1)?;
+            let mut b2 = self.pinned_pool.get(cpu.w1_scale.nbytes())?;
+            let w1_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w1_scale, &mut b2)?;
+            let mut b3 = self.pinned_pool.get(w3_bf16.nbytes())?;
+            let w3 = GpuTensor::from_host_pinned(self.device.clone(), &w3_bf16, &mut b3)?;
+            let mut b4 = self.pinned_pool.get(cpu.w3_scale.nbytes())?;
+            let w3_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w3_scale, &mut b4)?;
+            let mut b5 = self.pinned_pool.get(w2_bf16.nbytes())?;
+            let w2 = GpuTensor::from_host_pinned(self.device.clone(), &w2_bf16, &mut b5)?;
+            let mut b6 = self.pinned_pool.get(cpu.w2_scale.nbytes())?;
+            let w2_scale = GpuTensor::from_host_pinned(self.device.clone(), &cpu.w2_scale, &mut b6)?;
+            Arc::new(ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale })
+        };
+
+        let _ = self.three_level.gpu.put(layer_id, expert_id, Arc::clone(&weights));
 
         Ok(weights)
     }
@@ -294,6 +329,18 @@ impl ExpertScheduler {
                 dequant_fp4_e2m1_to_bf16(&weight.data, &scale.data, &weight.shape, logical_k)
             }
             _ => Err(anyhow!("unsupported expert weight dtype: {}", weight.dtype)),
+        }
+    }
+
+    /// 修正 safetensors 加载的 FP4 权重 dtype
+    /// safetensors 中 FP4 权重以 I8 格式存储（2个FP4值打包为1个int8字节），
+    /// weight.rs 的 safetensors_dtype_to_dtype 将 I8 映射为 UINT8，
+    /// 但 FP4 GEMM 路径需要 DType::FP4E2M1 才能正确进入快速路径
+    fn fix_fp4_dtype(&self, tensor: CpuTensor) -> CpuTensor {
+        if self.expert_dtype == DType::FP4E2M1 && tensor.dtype == DType::UINT8 {
+            CpuTensor::new(tensor.data, tensor.shape, DType::FP4E2M1)
+        } else {
+            tensor
         }
     }
 
@@ -392,8 +439,16 @@ impl ExpertScheduler {
             return Ok(true);
         }
 
+        if let Some(data) = self.three_level.ram.get_copy(layer_id, expert_id) {
+            if let Ok(expert) = self.deserialize_expert(&data) {
+                self.cpu_cache.insert(key, expert);
+                return Ok(true);
+            }
+        }
+
         if let Some(mmap) = self.three_level.ssd.mmap_prefetch(layer_id, expert_id) {
             let expert = self.deserialize_expert(&mmap)?;
+            self.three_level.ram.put(layer_id, expert_id, mmap.to_vec());
             self.cpu_cache.insert(key, expert);
             return Ok(true);
         }
@@ -403,13 +458,6 @@ impl ExpertScheduler {
             self.three_level.ram.put(layer_id, expert_id, data);
             self.cpu_cache.insert(key, expert);
             return Ok(true);
-        }
-
-        if let Some(data) = self.three_level.ram.get_copy(layer_id, expert_id) {
-            if let Ok(expert) = self.deserialize_expert(&data) {
-                self.cpu_cache.insert(key, expert);
-                return Ok(true);
-            }
         }
 
         Ok(false)
@@ -441,57 +489,27 @@ impl ExpertScheduler {
             return Ok(());
         }
 
-        let mut to_prefetch = Vec::new();
         for &eid in expert_ids {
             let key = (next_layer, eid);
+            if self.cpu_cache.contains_key(&key) {
+                continue;
+            }
             if self.three_level.gpu.contains(next_layer, eid)
                 || self.prefetch_pending.contains_key(&key)
             {
                 continue;
             }
 
-            if !self.cpu_cache.contains_key(&key) {
-                if self.load_from_ssd(next_layer, eid)? {
-                    // loaded from SSD/RAM cache
-                } else {
-                    let _ = self.load_expert(next_layer, eid, loader);
+            if self.three_level.ssd.contains(next_layer, eid) {
+                if let Some(data) = self.three_level.ssd.get(next_layer, eid) {
+                    if let Ok(expert) = self.deserialize_expert(&data) {
+                        self.three_level.ram.put(next_layer, eid, data);
+                        self.cpu_cache.insert(key, expert);
+                    }
                 }
-            }
-
-            if let Some(cpu) = self.cpu_cache.get(&key) {
-                to_prefetch.push((key, cpu.w1.nbytes(), cpu.w1_scale.nbytes(), cpu.w3.nbytes(), cpu.w3_scale.nbytes(), cpu.w2.nbytes(), cpu.w2_scale.nbytes()));
-            }
-        }
-
-        if to_prefetch.is_empty() || self.transfer_stream.is_none() {
-            return Ok(());
-        }
-
-        let stream = self.transfer_stream.as_ref().unwrap();
-        for (key, w1_sz, w1s_sz, w3_sz, w3s_sz, w2_sz, w2s_sz) in &to_prefetch {
-            let cpu = self.cpu_cache.get(key).unwrap();
-
-            let weights = if self.expert_dtype == DType::FP4E2M1 {
-                let w1 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1, self.pinned_pool.get(*w1_sz)?, stream)?;
-                let w1_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(*w1s_sz)?, stream)?;
-                let w3 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3, self.pinned_pool.get(*w3_sz)?, stream)?;
-                let w3_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(*w3s_sz)?, stream)?;
-                let w2 = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2, self.pinned_pool.get(*w2_sz)?, stream)?;
-                let w2_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(*w2s_sz)?, stream)?;
-                ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale }
             } else {
-                let w1_bf16 = self.dequant_to_bf16(&cpu.w1, &cpu.w1_scale)?;
-                let w3_bf16 = self.dequant_to_bf16(&cpu.w3, &cpu.w3_scale)?;
-                let w2_bf16 = self.dequant_to_bf16(&cpu.w2, &cpu.w2_scale)?;
-                let w1 = GpuTensor::from_host_pinned_async(self.device.clone(), &w1_bf16, self.pinned_pool.get(w1_bf16.nbytes())?, stream)?;
-                let w1_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w1_scale, self.pinned_pool.get(*w1s_sz)?, stream)?;
-                let w3 = GpuTensor::from_host_pinned_async(self.device.clone(), &w3_bf16, self.pinned_pool.get(w3_bf16.nbytes())?, stream)?;
-                let w3_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w3_scale, self.pinned_pool.get(*w3s_sz)?, stream)?;
-                let w2 = GpuTensor::from_host_pinned_async(self.device.clone(), &w2_bf16, self.pinned_pool.get(w2_bf16.nbytes())?, stream)?;
-                let w2_scale = GpuTensor::from_host_pinned_async(self.device.clone(), &cpu.w2_scale, self.pinned_pool.get(*w2s_sz)?, stream)?;
-                ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale }
-            };
-            self.prefetch_pending.insert(*key, weights);
+                let _ = self.load_expert(next_layer, eid, loader);
+            }
         }
 
         Ok(())
@@ -501,16 +519,10 @@ impl ExpertScheduler {
         if let Some(ref stream) = self.transfer_stream {
             stream.synchronize().ok();
         }
+        self.prefetch_pinned.clear();
         let pending: Vec<_> = self.prefetch_pending.drain().collect();
         for (key, weights) in pending {
-            let _ = self.three_level.gpu.put(key.0, key.1, ExpertWeights {
-                w1: weights.w1.clone(),
-                w1_scale: weights.w1_scale.clone(),
-                w3: weights.w3.clone(),
-                w3_scale: weights.w3_scale.clone(),
-                w2: weights.w2.clone(),
-                w2_scale: weights.w2_scale.clone(),
-            });
+            let _ = self.three_level.gpu.put(key.0, key.1, weights);
         }
     }
 
@@ -566,5 +578,68 @@ impl ExpertScheduler {
         let total = self.three_level.gpu.max_capacity();
         if total == 0 { return 0.0; }
         used as f64 / total as f64
+    }
+
+    pub fn clear_gpu_cache(&mut self) {
+        self.three_level.gpu.clear();
+    }
+
+    pub fn upload_expert_raw(&mut self, layer_id: usize, expert_id: usize) -> Result<ExpertWeights> {
+        let key = (layer_id, expert_id);
+
+        let cpu = match self.cpu_cache.get(&key) {
+            Some(c) => c,
+            None => {
+                if self.load_from_ssd(layer_id, expert_id)? {
+                    self.cpu_cache.get(&key)
+                        .ok_or_else(|| anyhow!("expert {}/{} loaded but missing from CPU cache", layer_id, expert_id))?
+                } else {
+                    return Err(anyhow!("expert {}/{} not found in any cache", layer_id, expert_id));
+                }
+            }
+        };
+
+        let slots = &self.gpu_slots;
+        let device = &self.device;
+
+        let copy_to_slot = |slot: &Arc<cudarc::driver::CudaSlice<u8>>, cpu_tensor: &CpuTensor, shape: Vec<usize>, dtype: DType| -> Result<GpuTensor> {
+            let nbytes = cpu_tensor.nbytes();
+            let tmp = GpuTensor {
+                slice: Arc::clone(slot),
+                shape: shape.clone(),
+                dtype,
+                device: device.clone(),
+            };
+            let dst_ptr = tmp.device_ptr();
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoD_v2(
+                    dst_ptr as cudarc::driver::sys::CUdeviceptr,
+                    cpu_tensor.data.as_ptr() as *const std::ffi::c_void,
+                    nbytes,
+                );
+            }
+            Ok(tmp)
+        };
+
+        if self.expert_dtype == DType::FP4E2M1 {
+            let w1 = copy_to_slot(&slots.w1, &cpu.w1, slots.w1_shape.clone(), DType::FP4E2M1)?;
+            let w1_scale = copy_to_slot(&slots.w1_scale, &cpu.w1_scale, slots.w1_scale_shape.clone(), DType::FP8E8M0)?;
+            let w3 = copy_to_slot(&slots.w3, &cpu.w3, slots.w3_shape.clone(), DType::FP4E2M1)?;
+            let w3_scale = copy_to_slot(&slots.w3_scale, &cpu.w3_scale, slots.w3_scale_shape.clone(), DType::FP8E8M0)?;
+            let w2 = copy_to_slot(&slots.w2, &cpu.w2, slots.w2_shape.clone(), DType::FP4E2M1)?;
+            let w2_scale = copy_to_slot(&slots.w2_scale, &cpu.w2_scale, slots.w2_scale_shape.clone(), DType::FP8E8M0)?;
+            Ok(ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale })
+        } else {
+            let w1_bf16 = self.dequant_to_bf16(&cpu.w1, &cpu.w1_scale)?;
+            let w3_bf16 = self.dequant_to_bf16(&cpu.w3, &cpu.w3_scale)?;
+            let w2_bf16 = self.dequant_to_bf16(&cpu.w2, &cpu.w2_scale)?;
+            let w1 = copy_to_slot(&slots.w1, &w1_bf16, slots.w1_shape.clone(), DType::BF16)?;
+            let w1_scale = copy_to_slot(&slots.w1_scale, &cpu.w1_scale, slots.w1_scale_shape.clone(), DType::FP8E8M0)?;
+            let w3 = copy_to_slot(&slots.w3, &w3_bf16, slots.w3_shape.clone(), DType::BF16)?;
+            let w3_scale = copy_to_slot(&slots.w3_scale, &cpu.w3_scale, slots.w3_scale_shape.clone(), DType::FP8E8M0)?;
+            let w2 = copy_to_slot(&slots.w2, &w2_bf16, slots.w2_shape.clone(), DType::BF16)?;
+            let w2_scale = copy_to_slot(&slots.w2_scale, &cpu.w2_scale, slots.w2_scale_shape.clone(), DType::FP8E8M0)?;
+            Ok(ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale })
+        }
     }
 }

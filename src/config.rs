@@ -138,7 +138,12 @@ impl ModelConfig {
 
     pub fn from_dir(model_dir: &str) -> Result<Self> {
         let config_path = Path::new(model_dir).join("config.json");
-        Self::from_file(config_path.to_str().with_context(|| "invalid path encoding")?)
+        let mut config = Self::from_file(config_path.to_str().with_context(|| "invalid path encoding")?)?;
+        if std::env::var("DS4RS_SWA_ONLY").as_deref() == Ok("1") {
+            eprintln!("[config] DS4RS_SWA_ONLY=1: overriding all compress_ratios to 0 (pure sliding window)");
+            config.compress_ratios = vec![0; config.num_hidden_layers];
+        }
+        Ok(config)
     }
 
     pub fn head_dim_non_rope(&self) -> usize {

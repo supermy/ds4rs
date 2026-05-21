@@ -25,6 +25,7 @@ pub struct Indexer {
     kv_cache_cpu: Vec<half::bf16>,
     hadamard_gpu: GpuTensor,
     kernels: Arc<KernelRegistry>,
+    transfer_stream: Option<Arc<cudarc::driver::CudaStream>>,
 }
 
 impl Indexer {
@@ -107,33 +108,28 @@ impl Indexer {
             index_topk,
             compress_ratio,
             softmax_scale,
-            device,
+            device: device.clone(),
             cublas,
             kv_cache_cpu,
             hadamard_gpu,
             kernels,
+            transfer_stream: device.new_stream().ok(),
         })
     }
 
     fn gpu_bf16_to_f32(&self, gpu: &GpuTensor, total: usize, dim: usize) -> Result<Vec<f32>> {
         if gpu.dtype == DType::BF16 {
-            let kernel_name = match dim {
-                4096 => Some("cast_bf16_to_f32_N4096"),
-                16384 => Some("cast_bf16_to_f32_N16384"),
-                _ => None,
+            let kernel_name = format!("cast_bf16_to_f32_N{}", dim);
+            let x_2d = GpuTensor {
+                slice: gpu.slice.clone(),
+                shape: vec![total, dim],
+                dtype: DType::BF16,
+                device: gpu.device.clone(),
             };
-            if let Some(kname) = kernel_name {
-                let x_2d = GpuTensor {
-                    slice: gpu.slice.clone(),
-                    shape: vec![total, dim],
-                    dtype: DType::BF16,
-                    device: gpu.device.clone(),
-                };
-                let x_f32 = GpuTensor::zeros(self.device.clone(), vec![total, dim], DType::FP32)?;
-                if self.kernels.call(kname, &[&x_2d, &x_f32]).is_ok() {
-                    let host = x_f32.to_host()?;
-                    return Ok(bytemuck::cast_slice(&host.data).to_vec());
-                }
+            let x_f32 = GpuTensor::zeros(self.device.clone(), vec![total, dim], DType::FP32)?;
+            if self.kernels.call(&kernel_name, &[&x_2d, &x_f32]).is_ok() {
+                let host = x_f32.to_host()?;
+                return Ok(bytemuck::cast_slice(&host.data).to_vec());
             }
         }
 
@@ -156,7 +152,8 @@ impl Indexer {
         let wq_out_dim = n_heads * head_dim;
 
         let q_f32 = GpuTensor::zeros(self.device.clone(), vec![total, wq_out_dim], DType::FP32).ok()?;
-        self.kernels.call("cast_bf16_to_f32_N4096", &[q_gpu, &q_f32]).ok()?;
+        let cast_kernel = format!("cast_bf16_to_f32_N{}", wq_out_dim);
+        self.kernels.call(&cast_kernel, &[q_gpu, &q_f32]).ok()?;
 
         let q_per_head = GpuTensor {
             slice: q_f32.slice.clone(),
@@ -244,7 +241,8 @@ impl Indexer {
                 device: self.kv_cache.device.clone(),
             };
             let kv_f32 = GpuTensor::zeros(self.device.clone(), vec![bsz * n_comp_tokens, head_dim], DType::FP32).ok()?;
-            self.kernels.call("cast_bf16_to_f32_N128", &[&kv_bf16_2d, &kv_f32]).ok()?;
+            let kv_cast_kernel = format!("cast_bf16_to_f32_N{}", head_dim);
+            self.kernels.call(&kv_cast_kernel, &[&kv_bf16_2d, &kv_f32]).ok()?;
             GpuTensor {
                 slice: kv_f32.slice,
                 shape: vec![bsz, n_comp_tokens, head_dim],
@@ -341,7 +339,122 @@ impl Indexer {
 
         let q_proj_gpu = self.try_gpu_q_postprocess(&q_gpu, total, n_heads, head_dim, start_pos, seqlen);
 
-        let q_proj = if let Some(ref gpu) = q_proj_gpu {
+        let _compressed = self.compressor.forward(x, start_pos, bsz, seqlen)?;
+
+        let scatter_pending = if let Some(ref compressed) = _compressed {
+            let n_comp_tokens_out = compressed.shape.get(1).copied().unwrap_or(1);
+            let kv_total_cols = self.kv_cache.shape[1];
+            let write_start = if start_pos == 0 { 0 } else { start_pos / ratio };
+
+            let elem_size = 2usize;
+            let src_batch_stride = n_comp_tokens_out * head_dim * elem_size;
+            let dst_batch_stride = kv_total_cols * head_dim * elem_size;
+            let copy_bytes = n_comp_tokens_out * head_dim * elem_size;
+            let dst_offset = write_start * head_dim * elem_size;
+
+            if let Some(ref stream) = self.transfer_stream {
+                if GpuTensor::d2d_scatter_rows_async(
+                    compressed,
+                    &mut self.kv_cache,
+                    src_batch_stride,
+                    dst_batch_stride,
+                    copy_bytes,
+                    dst_offset,
+                    bsz,
+                    stream,
+                ).is_ok() {
+                    Some(true)
+                } else {
+                    eprintln!("warning: D2D scatter failed, fell back to H2D");
+                    self.scatter_fallback(compressed, n_comp_tokens_out, kv_total_cols, write_start, bsz);
+                    Some(false)
+                }
+            } else {
+                if GpuTensor::d2d_scatter_rows(
+                    compressed,
+                    &mut self.kv_cache,
+                    src_batch_stride,
+                    dst_batch_stride,
+                    copy_bytes,
+                    dst_offset,
+                    bsz,
+                ).is_ok() {
+                    Some(false)
+                } else {
+                    eprintln!("warning: D2D scatter failed, fell back to H2D");
+                    self.scatter_fallback(compressed, n_comp_tokens_out, kv_total_cols, write_start, bsz);
+                    Some(false)
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref compressed) = _compressed {
+            let n_comp_tokens_out = compressed.shape.get(1).copied().unwrap_or(1);
+            let kv_total_cols = self.kv_cache.shape[1];
+            let write_start = if start_pos == 0 { 0 } else { start_pos / ratio };
+            self.sync_cpu_mirror(compressed, n_comp_tokens_out, kv_total_cols, write_start, bsz);
+        }
+
+        let dim = x.shape[x.shape.len() - 1];
+        let x_2d = GpuTensor {
+            slice: x.slice.clone(),
+            shape: vec![total, dim],
+            dtype: x.dtype,
+            device: x.device.clone(),
+        };
+        let mut weights_gpu = GpuTensor::zeros(self.device.clone(), vec![total, n_heads], DType::BF16)?;
+        self.cublas.gemm_bf16(total, n_heads, dim, &x_2d, &self.weights_proj, &mut weights_gpu, 1.0, 0.0)?;
+
+        let weights_f32_gpu = {
+            let wf32 = GpuTensor::zeros(self.device.clone(), vec![total, n_heads], DType::FP32)?;
+            let w_cast_kernel = format!("cast_bf16_to_f32_N{}", n_heads);
+            if self.kernels.call(&w_cast_kernel, &[
+                &GpuTensor { slice: weights_gpu.slice.clone(), shape: vec![total, n_heads], dtype: DType::BF16, device: weights_gpu.device.clone() },
+                &wf32,
+            ]).is_ok() {
+                let scale_factor = self.softmax_scale * (n_heads as f32).powf(-0.5);
+                let sf_cpu = CpuTensor::new(bytemuck::cast_slice(&[scale_factor]).to_vec(), vec![1], DType::FP32);
+                let sf_gpu = GpuTensor::from_host(self.device.clone(), &sf_cpu)?;
+                let scaled = GpuTensor::zeros(self.device.clone(), vec![total, n_heads], DType::FP32)?;
+                let scale_kernel = format!("scale_f32_N{}", n_heads);
+                if self.kernels.call(&scale_kernel, &[&wf32, &sf_gpu, &scaled]).is_ok() {
+                    Some(scaled)
+                } else {
+                    let host = wf32.to_host()?;
+                    let f32_data: &[f32] = bytemuck::cast_slice(&host.data);
+                    let scaled_data: Vec<f32> = f32_data.iter().map(|v| v * scale_factor).collect();
+                    let cpu = CpuTensor::new(bytemuck::cast_slice(&scaled_data).to_vec(), vec![total, n_heads], DType::FP32);
+                    Some(GpuTensor::from_host(self.device.clone(), &cpu)?)
+                }
+            } else {
+                let host = weights_gpu.to_host()?;
+                let bf16: &[half::bf16] = bytemuck::cast_slice(&host.data);
+                let scale_factor = self.softmax_scale * (n_heads as f32).powf(-0.5);
+                let scaled_data: Vec<f32> = bf16.iter().map(|v| v.to_f32() * scale_factor).collect();
+                let cpu = CpuTensor::new(bytemuck::cast_slice(&scaled_data).to_vec(), vec![total, n_heads], DType::FP32);
+                Some(GpuTensor::from_host(self.device.clone(), &cpu)?)
+            }
+        };
+
+        let n_comp_tokens = end_pos / ratio;
+
+        if scatter_pending == Some(true) {
+            if let Some(ref stream) = self.transfer_stream {
+                stream.synchronize().ok();
+            }
+        }
+
+        if let (Some(ref q_gpu), Some(ref w_gpu)) = (&q_proj_gpu, &weights_f32_gpu) {
+            if let Some(gpu_result) = self.try_gpu_index_score(
+                q_gpu, w_gpu, n_comp_tokens, bsz, seqlen, start_pos, offset,
+            ) {
+                return Ok(gpu_result);
+            }
+        }
+
+        let q_proj: Vec<f32> = if let Some(ref gpu) = q_proj_gpu {
             let host = gpu.to_host()?;
             bytemuck::cast_slice(&host.data).to_vec()
         } else {
@@ -377,100 +490,6 @@ impl Indexer {
             }
             qp
         };
-
-        let _compressed = self.compressor.forward(x, start_pos, bsz, seqlen)?;
-
-        if let Some(ref compressed) = _compressed {
-            let n_comp_tokens_out = compressed.shape.get(1).copied().unwrap_or(1);
-            let kv_total_cols = self.kv_cache.shape[1];
-            let write_start = if start_pos == 0 { 0 } else { start_pos / ratio };
-
-            let elem_size = 2usize;
-            let src_batch_stride = n_comp_tokens_out * head_dim * elem_size;
-            let dst_batch_stride = kv_total_cols * head_dim * elem_size;
-            let copy_bytes = n_comp_tokens_out * head_dim * elem_size;
-            let dst_offset = write_start * head_dim * elem_size;
-            if let Err(e) = GpuTensor::d2d_scatter_rows(
-                compressed,
-                &mut self.kv_cache,
-                src_batch_stride,
-                dst_batch_stride,
-                copy_bytes,
-                dst_offset,
-                bsz,
-            ) {
-                let comp_host = compressed.to_host()?;
-                let comp_bf16: &[half::bf16] = bytemuck::cast_slice(&comp_host.data);
-                for b in 0..bsz {
-                    let dst_base = b * kv_total_cols * head_dim + write_start * head_dim;
-                    for g in 0..n_comp_tokens_out {
-                        let src_off = (b * n_comp_tokens_out + g) * head_dim;
-                        let dst_off = dst_base + g * head_dim;
-                        if dst_off + head_dim <= self.kv_cache_cpu.len() && src_off + head_dim <= comp_bf16.len() {
-                            for dd in 0..head_dim {
-                                self.kv_cache_cpu[dst_off + dd] = comp_bf16[src_off + dd];
-                            }
-                        }
-                    }
-                }
-                let out_cpu = CpuTensor::new(
-                    bytemuck::cast_slice(&self.kv_cache_cpu).to_vec(),
-                    self.kv_cache.shape.clone(),
-                    DType::BF16,
-                );
-                self.kv_cache = GpuTensor::from_host(self.device.clone(), &out_cpu)?;
-                eprintln!("warning: D2D scatter failed, fell back to H2D: {}", e);
-            }
-        }
-
-        let dim = x.shape[x.shape.len() - 1];
-        let x_2d = GpuTensor {
-            slice: x.slice.clone(),
-            shape: vec![total, dim],
-            dtype: x.dtype,
-            device: x.device.clone(),
-        };
-        let mut weights_gpu = GpuTensor::zeros(self.device.clone(), vec![total, n_heads], DType::BF16)?;
-        self.cublas.gemm_bf16(total, n_heads, dim, &x_2d, &self.weights_proj, &mut weights_gpu, 1.0, 0.0)?;
-
-        let weights_f32_gpu = {
-            let wf32 = GpuTensor::zeros(self.device.clone(), vec![total, n_heads], DType::FP32)?;
-            if self.kernels.call("cast_bf16_to_f32_N4096", &[
-                &GpuTensor { slice: weights_gpu.slice.clone(), shape: vec![total, n_heads], dtype: DType::BF16, device: weights_gpu.device.clone() },
-                &wf32,
-            ]).is_ok() {
-                let scale_factor = self.softmax_scale * (n_heads as f32).powf(-0.5);
-                let sf_cpu = CpuTensor::new(bytemuck::cast_slice(&[scale_factor]).to_vec(), vec![1], DType::FP32);
-                let sf_gpu = GpuTensor::from_host(self.device.clone(), &sf_cpu)?;
-                let scaled = GpuTensor::zeros(self.device.clone(), vec![total, n_heads], DType::FP32)?;
-                if self.kernels.call("scale_f32_N4096", &[&wf32, &sf_gpu, &scaled]).is_ok() {
-                    Some(scaled)
-                } else {
-                    let host = wf32.to_host()?;
-                    let f32_data: &[f32] = bytemuck::cast_slice(&host.data);
-                    let scaled_data: Vec<f32> = f32_data.iter().map(|v| v * scale_factor).collect();
-                    let cpu = CpuTensor::new(bytemuck::cast_slice(&scaled_data).to_vec(), vec![total, n_heads], DType::FP32);
-                    Some(GpuTensor::from_host(self.device.clone(), &cpu)?)
-                }
-            } else {
-                let host = weights_gpu.to_host()?;
-                let bf16: &[half::bf16] = bytemuck::cast_slice(&host.data);
-                let scale_factor = self.softmax_scale * (n_heads as f32).powf(-0.5);
-                let scaled_data: Vec<f32> = bf16.iter().map(|v| v.to_f32() * scale_factor).collect();
-                let cpu = CpuTensor::new(bytemuck::cast_slice(&scaled_data).to_vec(), vec![total, n_heads], DType::FP32);
-                Some(GpuTensor::from_host(self.device.clone(), &cpu)?)
-            }
-        };
-
-        let n_comp_tokens = end_pos / ratio;
-
-        if let (Some(ref q_gpu), Some(ref w_gpu)) = (&q_proj_gpu, &weights_f32_gpu) {
-            if let Some(gpu_result) = self.try_gpu_index_score(
-                q_gpu, w_gpu, n_comp_tokens, bsz, seqlen, start_pos, offset,
-            ) {
-                return Ok(gpu_result);
-            }
-        }
 
         let weights: Vec<f32> = if let Some(ref w_gpu) = weights_f32_gpu {
             let host = w_gpu.to_host()?;
@@ -530,7 +549,7 @@ impl Indexer {
                 let score_base = (b * seqlen + s) * n_comp_tokens;
                 let mut idx: Vec<usize> = (0..n_comp_tokens).collect();
                 idx.sort_by(|&a, &b| {
-                    index_score[score_base + b].partial_cmp(&index_score[score_base + a]).unwrap()
+                    index_score[score_base + b].total_cmp(&index_score[score_base + a])
                 });
                 for k in 0..topk {
                     let raw_idx = idx[k] as i32;
@@ -549,5 +568,65 @@ impl Indexer {
             DType::INT32,
         );
         GpuTensor::from_host(self.device.clone(), &cpu)
+    }
+
+    fn sync_cpu_mirror(
+        &mut self,
+        compressed: &GpuTensor,
+        n_comp_tokens_out: usize,
+        kv_total_cols: usize,
+        write_start: usize,
+        bsz: usize,
+    ) {
+        let head_dim = self.head_dim;
+        if let Ok(comp_host) = compressed.to_host() {
+            let comp_bf16: &[half::bf16] = bytemuck::cast_slice(&comp_host.data);
+            for b in 0..bsz {
+                let dst_base = b * kv_total_cols * head_dim + write_start * head_dim;
+                for g in 0..n_comp_tokens_out {
+                    let src_off = (b * n_comp_tokens_out + g) * head_dim;
+                    let dst_off = dst_base + g * head_dim;
+                    if dst_off + head_dim <= self.kv_cache_cpu.len() && src_off + head_dim <= comp_bf16.len() {
+                        for dd in 0..head_dim {
+                            self.kv_cache_cpu[dst_off + dd] = comp_bf16[src_off + dd];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn scatter_fallback(
+        &mut self,
+        compressed: &GpuTensor,
+        n_comp_tokens_out: usize,
+        kv_total_cols: usize,
+        write_start: usize,
+        bsz: usize,
+    ) {
+        let head_dim = self.head_dim;
+        if let Ok(comp_host) = compressed.to_host() {
+            let comp_bf16: &[half::bf16] = bytemuck::cast_slice(&comp_host.data);
+            for b in 0..bsz {
+                let dst_base = b * kv_total_cols * head_dim + write_start * head_dim;
+                for g in 0..n_comp_tokens_out {
+                    let src_off = (b * n_comp_tokens_out + g) * head_dim;
+                    let dst_off = dst_base + g * head_dim;
+                    if dst_off + head_dim <= self.kv_cache_cpu.len() && src_off + head_dim <= comp_bf16.len() {
+                        for dd in 0..head_dim {
+                            self.kv_cache_cpu[dst_off + dd] = comp_bf16[src_off + dd];
+                        }
+                    }
+                }
+            }
+            let out_cpu = CpuTensor::new(
+                bytemuck::cast_slice(&self.kv_cache_cpu).to_vec(),
+                self.kv_cache.shape.clone(),
+                DType::BF16,
+            );
+            if let Ok(new_cache) = GpuTensor::from_host(self.device.clone(), &out_cpu) {
+                self.kv_cache = new_cache;
+            }
+        }
     }
 }

@@ -18,6 +18,19 @@ bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 memmap2 = "0.9"
 anyhow = "1"
+tokenizers = "0.21"
+rand = "0.9"
 pyo3 = { version = "0.23", features = ["auto-initialize"], optional = true }
+
+[[bin]]
+name = "ds4_cli"
+path = "src/bin/ds4_cli.rs"
+
+[[bin]]
+name = "test_iq2_xs_quant"
+path = "src/bin/test_iq2_xs_quant.rs"
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]

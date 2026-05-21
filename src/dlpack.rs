@@ -44,6 +44,10 @@ impl DLDataType {
         let (code, bits, lanes) = dtype.dlpack_type_code();
         Self { code, bits, lanes }
     }
+
+    pub fn new(code: u8, bits: u8, lanes: u16) -> Self {
+        Self { code, bits, lanes }
+    }
 }
 
 #[repr(C)]
@@ -80,3 +84,12 @@ impl DLTensor {
 }
 
 unsafe impl Send for DLTensor {}
+
+#[repr(C)]
+pub struct DLManagedTensor {
+    pub dl_tensor: DLTensor,
+    pub manager_ctx: *mut c_void,
+    pub deleter: Option<unsafe extern "C" fn(*mut DLManagedTensor)>,
+}
+
+unsafe impl Send for DLManagedTensor {}

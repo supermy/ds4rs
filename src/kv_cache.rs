@@ -129,7 +129,6 @@ impl KvCache {
         }
 
         let win = self.window_size;
-        let head_dim = self.head_dim;
 
         if seqlen <= win {
             let dst_offset = self.byte_offset(batch_idx, 0);
@@ -137,18 +136,17 @@ impl KvCache {
         } else {
             let cutoff = seqlen % win;
             let tail_start = seqlen - win;
-            let elem_size = 2usize;
-            let _row_bytes = head_dim * elem_size;
 
             let tail_gpu = self.d2d_extract_rows(&kv, tail_start, win)?;
 
             if cutoff > 0 {
+                let first_part = self.d2d_extract_rows(&tail_gpu, 0, win - cutoff)?;
                 let dst_offset = self.byte_offset(batch_idx, cutoff);
-                tail_gpu.copy_into_at(&mut self.cache, dst_offset)?;
+                first_part.copy_into_at(&mut self.cache, dst_offset)?;
 
-                let head_gpu = self.d2d_extract_rows(&kv, 0, cutoff)?;
+                let second_part = self.d2d_extract_rows(&tail_gpu, win - cutoff, cutoff)?;
                 let head_dst = self.byte_offset(batch_idx, 0);
-                head_gpu.copy_into_at(&mut self.cache, head_dst)?;
+                second_part.copy_into_at(&mut self.cache, head_dst)?;
             } else {
                 let dst_offset = self.byte_offset(batch_idx, 0);
                 tail_gpu.copy_into_at(&mut self.cache, dst_offset)?;

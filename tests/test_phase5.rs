@@ -14,9 +14,11 @@ const MODEL_DIR: &str = "/models";
 #[test]
 fn test_gpu_expert_cache_create() {
     let device = make_device();
-    let config = Arc::new(ModelConfig::from_dir(MODEL_DIR).unwrap_or_else(|_| {
-        ModelConfig::from_file("nonexistent").unwrap()
-    }));
+    let config = if model_available() {
+        Arc::new(ModelConfig::from_dir(MODEL_DIR).unwrap())
+    } else {
+        return eprintln!("skipping: model not available");
+    };
     let cache = GpuExpertCache::new(device, config, 4);
     assert_eq!(cache.len(), 0);
     assert_eq!(cache.max_capacity(), 4);
@@ -42,7 +44,7 @@ fn test_gpu_expert_cache_put_get() {
 
     let weights = ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale };
 
-    cache.put(0, 0, weights).unwrap();
+    cache.put(0, 0, Arc::new(weights)).unwrap();
     assert_eq!(cache.len(), 1);
     assert!(cache.contains(0, 0));
 
@@ -71,7 +73,7 @@ fn test_gpu_expert_cache_lfu_eviction() {
         let w2_scale = GpuTensor::zeros(device.clone(), vec![1], DType::FP8E8M0).unwrap();
 
         let weights = ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale };
-        cache.put(0, expert_id, weights).unwrap();
+        cache.put(0, expert_id, Arc::new(weights)).unwrap();
     }
 
     let _ = cache.get(0, 0);
@@ -86,7 +88,7 @@ fn test_gpu_expert_cache_lfu_eviction() {
     let w2_scale = GpuTensor::zeros(device.clone(), vec![1], DType::FP8E8M0).unwrap();
 
     let weights = ExpertWeights { w1, w1_scale, w3, w3_scale, w2, w2_scale };
-    cache.put(0, 2, weights).unwrap();
+    cache.put(0, 2, Arc::new(weights)).unwrap();
 
     assert_eq!(cache.len(), 2);
     assert!(cache.contains(0, 0));
@@ -97,6 +99,7 @@ fn test_gpu_expert_cache_lfu_eviction() {
 
 #[test]
 fn test_ram_expert_cache_slru() {
+    let _device = make_device();
     let mut cache = RamExpertCache::new(1, 2);
 
     let data1 = vec![1u8; 512 * 1024];
@@ -111,7 +114,7 @@ fn test_ram_expert_cache_slru() {
     assert!(cache.contains(0, 1));
     assert!(cache.contains(0, 2));
 
-    let result = cache.get(0, 2);
+    let result = cache.get_copy(0, 2);
     assert!(result.is_some());
     assert_eq!(result.unwrap()[0], 3u8);
 
@@ -120,6 +123,7 @@ fn test_ram_expert_cache_slru() {
 
 #[test]
 fn test_ram_cache_promotion() {
+    let _device = make_device();
     let mut cache = RamExpertCache::new(1, 2);
 
     let data1 = vec![1u8; 512 * 1024];

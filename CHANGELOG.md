@@ -2,6 +2,97 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2025-05-18
+
+### 🔴 关键内存泄漏修复
+
+#### 核心泄漏：Expert 对象 CPU 参数累积
+- **问题**: `_unload_activated_experts` 将 GPU 参数移到 CPU 保留在 Expert 对象中，导致 CPU 内存无限累积
+- **影响**: 每个 FP4 专家 ~24.5MB，2000 个不同专家 ≈ 49GB，直接导致 OOM 崩溃
+- **修复**: 卸载时直接删除 Expert 对象（`moe.experts[expert_id] = None`），而非移到 CPU
+- **结果**: 内存从 99.8% 降到稳定 ~6GB，推理 5 轮后无增长
+
+#### safetensors dtype 映射错误
+- **问题**: `_DTYPE_MAP` 键名（`INT8`, `FP8_E8M0`）与 safetensors header 实际键名（`I8`, `F8_E8M0`）不匹配
+- **影响**: 专家权重被错误解析为 `torch.uint8`，无法路由到 FP4 GEMM
+- **修复**: 添加 `I8`, `F8_E4M3`, `F8_E8M0`, `I64` 映射
+
+#### config.json 字段映射
+- **问题**: HuggingFace config.json 字段名与 ModelArgs 不匹配
+- **修复**: 添加完整字段名映射（`hidden_size` → `dim`, `num_hidden_layers` → `n_layers` 等）
+- **修复**: `quantization_config.fmt='e4m3'` 正确映射为 `dtype='fp8'`
+
+### 🟡 GPU 缓存优化
+
+#### GPU 缓存命中修复
+- **问题**: GPU 缓存命中时跳过参数设置，Expert 对象使用随机初始化参数
+- **修复**: GPU 缓存命中时，将缓存的 GPU 参数重新设置到 Expert 对象上
+
+#### 自动 warmup
+- **新增**: 启动时执行短推理收集 LFU 统计，将 top-200 热点专家常驻 GPU
+- **效果**: VRAM 从 10044MB → 12594MB (+2550MB)，预热热点专家
+
+#### GPU 缓存大小调整
+- **调整**: 从 350 减少到 200，避免 GPU OOM（16GB 限制）
+- **计算**: 常驻权重 ~10GB + 200 专家 ~2.5GB + 计算缓冲区 ~3GB = 15.5GB
+
+### 🟢 内存安全机制
+
+#### 内存水位监控
+- **新增**: `ExpertCache.check_memory_pressure()` 每 10 token 检查 `/proc/meminfo`
+- **阈值**: 可用内存 < 8GB 时触发紧急清理
+- **清理**: 释放 safetensors header 缓存、强制 GC、清空 CUDA 缓存
+
+#### L2 CPU 缓存禁用
+- **原因**: pinned memory 锁定物理页，96GB 内存不足以缓存大量专家
+- **决策**: `cpu_cache_size=0`，避免内存膨胀
+
+#### 直接 I/O 替代 mmap
+- **问题**: safetensors mmap 导致 OS 页缓存膨胀（46 × 3.4GB ≈ 156GB 潜力）
+- **修复**: `_read_tensor_no_mmap` 使用 `seek/read` 直接读取所需字节
+
+### 性能指标
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| RAM 使用 | 93.2GB (99.8%) | 5.7GB (稳定) |
+| Swap | 8GB (100%) | 2.8GB (稳定) |
+| 可用内存 | 208MB | 87.7GB |
+| 推理速度 | N/A (崩溃) | 1.0-1.25 t/s |
+| GPU VRAM | N/A | 12594MB |
+
+## [0.7.0] - 2025-05-18
+
+### Python 推理实现
+
+#### MoE 懒初始化
+- **懒初始化专家**: `MoE.__init__` 中 `self.experts = nn.ModuleList([None] * 256)`，不预分配权重
+- **`_ensure_expert(idx)`**: 按需创建空壳 Expert，避免 143GB 内存预分配
+- **回调钩子**: `_on_experts_needed` / `_on_experts_done` 在 Gate 计算后调用
+
+#### 三级缓存架构
+- **ExpertCache 类**: 统一管理 L1 GPU + L2 CPU + L3 SSD 三级缓存
+- **L1 GPU 缓存**: LFU 策略，200 个热点专家常驻 GPU (~2.5GB)
+- **L2 CPU 缓存**: LRU 策略，2000 个专家 pinned memory (~25GB)
+- **L3 SSD**: safetensors mmap 按需读取，文件句柄缓存
+- **缓存统计**: gpu_hits / cpu_hits / ssd_hits / gpu_evictions
+
+#### 推理速度优化
+- **移除 gc.collect() + empty_cache()**: 3.5x 提速 (0.14 → 0.49 t/s)
+- **param.data 替换**: 直接替换 Parameter 数据指针，避免重复创建对象
+- **int8→float4_e2m1fn_x2 view**: 零拷贝 dtype 转换
+- **GPU 缓存预热**: warmup 后加载 LFU top-200 专家常驻 GPU
+
+#### Bug 修复
+- **wo_a FP8 反量化**: checkpoint 中 wo_a 为 FP8，模型初始化为 BF16，需在 load_state_dict 前反量化
+- **weight.scale 引用**: setattr 后重新绑定 `module.weight.scale = module.scale`
+- **Head dtype 不匹配**: `x.float()` vs `weight.bfloat16()`，统一为 float
+
+#### 性能指标
+- 推理速度: 0.5-0.7 t/s (decode)
+- GPU VRAM: 12.6 GB (常驻)
+- 缓存命中率: L1 GPU 6%, L2 CPU 69%, L3 SSD 25%
+
 ## [0.6.0] - 2025-05-15
 
 ### P0: 严重D2H热点消除

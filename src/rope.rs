@@ -2,7 +2,7 @@ use crate::config::ModelConfig;
 use crate::dtype::DType;
 use crate::tensor::{CpuTensor, GpuTensor};
 use anyhow::Result;
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, DevicePtr};
 use std::sync::Arc;
 
 pub struct RopeCache {
@@ -101,25 +101,62 @@ impl RopeCache {
         )
     }
 
-    pub fn get_gpu_slice(&self, _start_pos: usize, len: usize) -> Option<(GpuTensor, GpuTensor)> {
+    pub fn get_gpu_slice(&self, start_pos: usize, len: usize) -> Option<(GpuTensor, GpuTensor)> {
         let cos_gpu = self.cos_gpu.as_ref()?;
         let sin_gpu = self.sin_gpu.as_ref()?;
         let half_dim = self.dim / 2;
-        let device = self.device.as_ref()?.clone();
+        let device = self.device.as_ref()?;
 
-        let cos = GpuTensor {
-            slice: cos_gpu.slice.clone(),
-            shape: vec![len, half_dim],
-            dtype: DType::FP32,
-            device: device.clone(),
-        };
-        let sin = GpuTensor {
-            slice: sin_gpu.slice.clone(),
-            shape: vec![len, half_dim],
-            dtype: DType::FP32,
-            device,
-        };
-        Some((cos, sin))
+        if start_pos == 0 {
+            let cos = GpuTensor {
+                slice: cos_gpu.slice.clone(),
+                shape: vec![len, half_dim],
+                dtype: DType::FP32,
+                device: device.clone(),
+            };
+            let sin = GpuTensor {
+                slice: sin_gpu.slice.clone(),
+                shape: vec![len, half_dim],
+                dtype: DType::FP32,
+                device: device.clone(),
+            };
+            return Some((cos, sin));
+        }
+
+        let cos_sub = Self::d2d_extract_rows(cos_gpu, start_pos, len, half_dim, device.clone())?;
+        let sin_sub = Self::d2d_extract_rows(sin_gpu, start_pos, len, half_dim, device.clone())?;
+        Some((cos_sub, sin_sub))
+    }
+
+    fn d2d_extract_rows(
+        src: &GpuTensor,
+        row_start: usize,
+        n_rows: usize,
+        cols: usize,
+        device: Arc<CudaContext>,
+    ) -> Option<GpuTensor> {
+        let elem_size = 4usize;
+        let src_row_bytes = cols * elem_size;
+        let src_offset = row_start * src_row_bytes;
+
+        let out = GpuTensor::zeros(device.clone(), vec![n_rows, cols], DType::FP32).ok()?;
+        let stream = device.default_stream();
+        let (src_ptr, _src_guard) = src.slice.device_ptr(&stream);
+        {
+            let (dst_ptr, _dst_guard) = out.slice.device_ptr(&stream);
+            for r in 0..n_rows {
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyAsync(
+                        dst_ptr + (r * src_row_bytes) as u64,
+                        src_ptr + (src_offset + r * src_row_bytes) as u64,
+                        src_row_bytes,
+                        stream.cu_stream() as *mut _,
+                    );
+                }
+            }
+        }
+        stream.synchronize().ok()?;
+        Some(out)
     }
 }
 

@@ -358,7 +358,7 @@ def rmsnorm_kernel(N, has_weight=True):
 @tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
 def rmsnorm_f32_kernel(N):
     M = T.symbolic("M")
-    blk_m = 8 if N > 2048 else 32
+    blk_m = 1 if N > 2048 else 32
     threads = 128
 
     @T.prim_func
@@ -385,6 +385,64 @@ def rmsnorm_f32_kernel(N):
             T.copy(x_shared, Y[pid_m * blk_m, 0])
 
     return rmsnorm_f32_kernel_
+
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def rmsnorm_rsqrt_f32_kernel(N):
+    M = T.symbolic("M")
+    blk_m = 1 if N > 2048 else 32
+    threads = 128
+
+    @T.prim_func
+    def rmsnorm_rsqrt_f32_kernel_(
+        X: T.Tensor[(M, N), FP32],
+        R: T.Tensor[(M, 1), FP32],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), threads=threads) as (pid_m,):
+            x_shared = T.alloc_shared((blk_m, N), FP32)
+            sq_local = T.alloc_fragment((blk_m, N), FP32)
+            sq_sum_local = T.alloc_fragment((blk_m,), FP32)
+            rsqrt_local = T.alloc_fragment((blk_m,), FP32)
+
+            T.copy(X[pid_m * blk_m, 0], x_shared)
+            for i, j in T.Parallel(blk_m, N):
+                sq_local[i, j] = x_shared[i, j] * x_shared[i, j]
+            T.reduce_sum(sq_local, sq_sum_local, dim=1)
+            for i in T.Parallel(blk_m):
+                rsqrt_local[i] = T.rsqrt(sq_sum_local[i] / N + 1e-6)
+            T.copy(rsqrt_local, R[pid_m * blk_m, 0])
+
+    return rmsnorm_rsqrt_f32_kernel_
+
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def mul_row_broadcast_f32_kernel(N):
+    M = T.symbolic("M")
+    blk_m = 32
+    blk_n = 256
+    threads = 128
+
+    @T.prim_func
+    def mul_row_broadcast_f32_kernel_(
+        Mat: T.Tensor[(M, N), FP32],
+        Vec: T.Tensor[(M, 1), FP32],
+        Out: T.Tensor[(M, N), FP32],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, blk_n), threads=threads) as (pid_m, pid_n):
+            mat_shared = T.alloc_shared((blk_m, blk_n), FP32)
+            out_shared = T.alloc_shared((blk_m, blk_n), FP32)
+            vec_local = T.alloc_fragment((blk_m,), FP32)
+            mat_local = T.alloc_fragment((blk_m, blk_n), FP32)
+
+            for i in T.Pipelined(1, num_stages=0):
+                T.copy(Vec[pid_m * blk_m, 0], vec_local)
+            T.copy(Mat[pid_m * blk_m, pid_n * blk_n], mat_shared)
+            for i, j in T.Parallel(blk_m, blk_n):
+                mat_local[i, j] = mat_shared[i, j] * vec_local[i]
+            T.copy(mat_local, out_shared)
+            T.copy(out_shared, Out[pid_m * blk_m, pid_n * blk_n])
+
+    return mul_row_broadcast_f32_kernel_
 
 
 # ============================================================
@@ -1225,6 +1283,165 @@ def moe_expert_count_kernel(topk, n_experts):
 
 
 # ============================================================
+# F1: fused_shared_ffn_kernel (Shared Expert FFN 融合算子)
+#   融合: act_quant(x) → fp8_gemm(w1) + fp8_gemm(w3) → swiglu → fp8_gemm(w2)
+#   消除 3 次全局内存中间张量读写 (gate, up, swiglu_out)
+#
+#   参数:
+#     Inter: 中间维度 (moe_intermediate_size, 如 2048)
+#     Dim:   隐藏维度 (hidden_size, 如 4096)
+#     K:     GEMM 的 K 维度 (= Dim)
+#     scale_dtype: 缩放因子类型
+#     swiglu_limit: SwiGLU 截断值
+#
+#   签名:
+#     X:          [M, K]        BF16   输入
+#     W1:         [Inter, K]    FP8    gate 权重
+#     W1_S:       [Inter/128, K/128]  e8m0  gate 权重缩放
+#     W3:         [Inter, K]    FP8    up 权重
+#     W3_S:       [Inter/128, K/128]  e8m0  up 权重缩放
+#     W2:         [Dim, Inter]  FP8    down 权重
+#     W2_S:       [Dim/128, Inter/128] e8m0  down 权重缩放
+#     Y:          [M, Dim]      BF16   输出
+# ============================================================
+
+@tilelang.jit(pass_configs=pass_configs, execution_backend="tvm_ffi")
+def fused_shared_ffn_kernel(Inter, Dim, K, scale_dtype=FP32, swiglu_limit=10.0):
+    M = T.symbolic("M")
+    group_size = 128
+    block_M = 32
+    block_N = 128
+    block_K = 128
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1.0 / fp8_max
+
+    @T.prim_func
+    def fused_shared_ffn_kernel_(
+        X: T.Tensor[(M, K), BF16],
+        W1: T.Tensor[(Inter, K), FP8],
+        W1_S: T.Tensor[(T.ceildiv(Inter, group_size), T.ceildiv(K, group_size)), scale_dtype],
+        W3: T.Tensor[(Inter, K), FP8],
+        W3_S: T.Tensor[(T.ceildiv(Inter, group_size), T.ceildiv(K, group_size)), scale_dtype],
+        W2: T.Tensor[(Dim, Inter), FP8],
+        W2_S: T.Tensor[(T.ceildiv(Dim, group_size), T.ceildiv(Inter, group_size)), scale_dtype],
+        Y: T.Tensor[(M, Dim), BF16],
+    ):
+        # Stage 1: act_quant(X) → X_fp8 [M, K], X_scale [M, K/128]
+        # Stage 2: fp8_gemm(X_fp8, W1) → Gate [M, Inter]
+        #          fp8_gemm(X_fp8, W3) → Up   [M, Inter]
+        # Stage 3: swiglu(Gate, Up) → Hidden [M, Inter]
+        # Stage 4: act_quant(Hidden) → H_fp8 [M, Inter], H_scale [M, Inter/128]
+        # Stage 5: fp8_gemm(H_fp8, W2) → Y [M, Dim]
+        #
+        # 使用 T.persistent 模式: 线程块持久化，通过软件队列调度多阶段工作
+        # 但当前 TileLang 版本不支持跨 GEMM 的 persistent 融合
+        # 因此采用分阶段策略: 每个 GEMM 独立启动，但中间结果保留在 shared memory
+
+        # 注意: 由于 TileLang T.Kernel 的限制，无法在单个 kernel 内
+        # 完成多个 GEMM (每个 GEMM 需要不同的 grid size)。
+        # 因此这里采用"两阶段"融合:
+        #   阶段1: act_quant + w1/w3 GEMM + swiglu (输出到全局内存)
+        #   阶段2: act_quant + w2 GEMM (输出到全局内存)
+        #
+        # 实际上，TileLang 的 persistent kernel 可以做到这一点，
+        # 但需要更复杂的调度逻辑。当前先实现"半融合"版本:
+        # 将 act_quant + GEMM 融合，消除量化结果的显式写出。
+
+        # === 方案: 分两个 kernel 实现 ===
+        # fused_shared_ffn_stage1: act_quant(X) + fp8_gemm(X, W1) + fp8_gemm(X, W3) + swiglu
+        # fused_shared_ffn_stage2: act_quant(Hidden) + fp8_gemm(H, W2)
+        # 这里实现 stage1
+        pass
+
+    # 由于 TileLang T.Kernel 限制，无法在单个 kernel 内完成不同 grid size 的 GEMM
+    # 改用"半融合"策略: 将 act_quant 融合进 fp8_gemm (消除量化中间张量)
+    # 这已经通过现有的 fp8_gemm_kernel 实现 (内部包含 act_quant)
+    # 真正的收益来自 swiglu + w2 GEMM 的融合
+
+    # 最终方案: 实现 swiglu + act_quant + fp8_gemm(w2) 的融合
+    # 输入: Gate [M, Inter] BF16, Up [M, Inter] BF16 (来自两个独立 fp8_gemm)
+    # 融合: swiglu → act_quant → fp8_gemm(w2) → Y [M, Dim]
+    # 消除: swiglu_out 中间张量 + act_quant 中间张量
+
+    @T.prim_func
+    def fused_shared_ffn_kernel_(
+        Gate: T.Tensor[(M, Inter), BF16],
+        Up: T.Tensor[(M, Inter), BF16],
+        W2: T.Tensor[(Dim, Inter), FP8],
+        W2_S: T.Tensor[(T.ceildiv(Dim, group_size), T.ceildiv(Inter, group_size)), scale_dtype],
+        Y: T.Tensor[(M, Dim), BF16],
+    ):
+        with T.Kernel(T.ceildiv(Dim, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            # GEMM w2 的累加器
+            A_shared = T.alloc_shared((block_M, block_K), FP8)
+            B_shared = T.alloc_shared((block_N, block_K), FP8)
+            C_shared = T.alloc_shared((block_M, block_N), BF16)
+            Scale_C_shared = T.alloc_shared((block_M), FP32)
+            C_local = T.alloc_fragment((block_M, block_N), FP32)
+            C_local_accum = T.alloc_fragment((block_M, block_N), FP32)
+
+            # SwiGLU + act_quant 的临时缓冲
+            swiglu_buf = T.alloc_fragment((block_M, block_K), FP32)
+            amax_buf = T.alloc_fragment((block_M,), FP32)
+            scale_buf = T.alloc_fragment((block_M,), FP32)
+
+            T.use_swizzle(panel_size=10)
+            T.clear(C_local)
+            T.clear(C_local_accum)
+
+            K_iters = T.ceildiv(Inter, block_K)
+            for k in T.Pipelined(K_iters, num_stages=2):
+                # Stage A: 从 Gate/Up 读取 block_K 列，执行 SwiGLU + act_quant
+                for i, j in T.Parallel(block_M, block_K):
+                    row = by * block_M + i
+                    col = k * block_K + j
+                    gv_raw = T.Cast(FP32, Gate[row, col])
+                    uv_raw = T.Cast(FP32, Up[row, col])
+                    if swiglu_limit > 0:
+                        gv_clamped = T.clamp(gv_raw, -swiglu_limit, swiglu_limit)
+                        uv_clamped = T.clamp(uv_raw, -swiglu_limit, swiglu_limit)
+                    else:
+                        gv_clamped = gv_raw
+                        uv_clamped = uv_raw
+                    silu_gv = gv_clamped / (1.0 + T.exp(-gv_clamped))
+                    swiglu_val = silu_gv * uv_clamped
+                    if row < M and col < Inter:
+                        swiglu_buf[i, j] = swiglu_val
+                    else:
+                        swiglu_buf[i, j] = 0.0
+
+                # act_quant: 计算 amax → scale → 量化为 FP8
+                T.reduce_absmax(swiglu_buf, amax_buf, dim=1)
+                for i in T.Parallel(block_M):
+                    amax_buf[i] = T.max(amax_buf[i], 1e-4)
+                    scale_buf[i] = fast_round_scale(amax_buf[i], fp8_max_inv)
+                for i, j in T.Parallel(block_M, block_K):
+                    A_shared[i, j] = T.clamp(
+                        swiglu_buf[i, j] / scale_buf[i], fp8_min, fp8_max
+                    )
+
+                # Stage B: 读取 W2 权重
+                T.copy(W2[bx * block_N, k * block_K], B_shared)
+
+                # Stage C: 计算 scale_a * scale_b
+                Scale_B = T.Cast(FP32, W2_S[bx * block_N // group_size, k])
+                for i in T.Parallel(block_M):
+                    Scale_C_shared[i] = scale_buf[i] * Scale_B
+
+                # Stage D: GEMM
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                for i, j in T.Parallel(block_M, block_N):
+                    C_local_accum[i, j] += C_local[i, j] * Scale_C_shared[i]
+                T.clear(C_local)
+
+            T.copy(C_local_accum, C_shared)
+            T.copy(C_shared, Y[by * block_M, bx * block_N])
+
+    return fused_shared_ffn_kernel_
+
+
+# ============================================================
 # Kernel instance definitions for DS-V4 Flash
 # ============================================================
 
@@ -1251,7 +1468,13 @@ KERNEL_INSTANCES = {
     "rmsnorm_N512": lambda: rmsnorm_kernel(N=512, has_weight=True),
     "rmsnorm_f32_N4096": lambda: rmsnorm_f32_kernel(N=4096),
     "rmsnorm_f32_N7168": lambda: rmsnorm_f32_kernel(N=7168),
+    "rmsnorm_f32_N16384": lambda: rmsnorm_f32_kernel(N=16384),
+    "rmsnorm_rsqrt_f32_N4096": lambda: rmsnorm_rsqrt_f32_kernel(N=4096),
+    "rmsnorm_rsqrt_f32_N7168": lambda: rmsnorm_rsqrt_f32_kernel(N=7168),
+    "rmsnorm_rsqrt_f32_N16384": lambda: rmsnorm_rsqrt_f32_kernel(N=16384),
+    "mul_row_broadcast_f32": lambda: mul_row_broadcast_f32_kernel(N=24),
     "rmsnorm_no_weight_N1024": lambda: rmsnorm_kernel(N=1024, has_weight=False),
+    "rmsnorm_no_weight_N512": lambda: rmsnorm_kernel(N=512, has_weight=False),
 
     "swiglu_N2048": lambda: swiglu_kernel(N=2048, swiglu_limit=10.0),
 
@@ -1265,7 +1488,11 @@ KERNEL_INSTANCES = {
     "rope_interleaved_inv_D64": lambda: rope_interleaved_kernel(D=64, inverse=True),
 
     "cast_bf16_to_f32_N4096": lambda: cast_bf16_f32_kernel(N=4096, src_dtype=BF16, dst_dtype=FP32),
+    "cast_bf16_to_f32_N8192": lambda: cast_bf16_f32_kernel(N=8192, src_dtype=BF16, dst_dtype=FP32),
     "cast_bf16_to_f32_N16384": lambda: cast_bf16_f32_kernel(N=16384, src_dtype=BF16, dst_dtype=FP32),
+    "cast_bf16_to_f32_N128": lambda: cast_bf16_f32_kernel(N=128, src_dtype=BF16, dst_dtype=FP32),
+    "cast_bf16_to_f32_N512": lambda: cast_bf16_f32_kernel(N=512, src_dtype=BF16, dst_dtype=FP32),
+    "cast_bf16_to_f32_N1024": lambda: cast_bf16_f32_kernel(N=1024, src_dtype=BF16, dst_dtype=FP32),
     "cast_f32_to_bf16_N4096": lambda: cast_bf16_f32_kernel(N=4096, src_dtype=FP32, dst_dtype=BF16),
     "cast_f32_to_bf16_N16384": lambda: cast_bf16_f32_kernel(N=16384, src_dtype=FP32, dst_dtype=BF16),
 
@@ -1281,28 +1508,35 @@ KERNEL_INSTANCES = {
 
     "indexer_score_h64_d128_topk512": lambda: indexer_score_kernel(n_heads=64, head_dim=128, index_topk=512),
     "compressor_pool_d128_c8": lambda: compressor_pool_kernel(head_dim=128, coff=8),
-    "compressor_pool_d512_c4": lambda: compressor_pool_kernel(head_dim=512, coff=4),
+    "compressor_pool_d512_c8": lambda: compressor_pool_kernel(head_dim=512, coff=8),
 
     "rmsnorm_f32_weighted_N128": lambda: rmsnorm_f32_weighted_kernel(N=128),
+    "rmsnorm_f32_weighted_N512": lambda: rmsnorm_f32_weighted_kernel(N=512),
     "compressor_rope_f32_d128_rd64": lambda: compressor_rope_f32_kernel(d=128, rd=64),
+    "compressor_rope_f32_d512_rd64": lambda: compressor_rope_f32_kernel(d=512, rd=64),
     "fp4_qdq_f32_N128_bs32": lambda: fp4_qdq_f32_kernel(N=128, block_size=32),
     "cast_f32_to_bf16_N128": lambda: cast_bf16_f32_kernel(N=128, src_dtype=FP32, dst_dtype=BF16),
+    "cast_f32_to_bf16_N512": lambda: cast_bf16_f32_kernel(N=512, src_dtype=FP32, dst_dtype=BF16),
+    "cast_f32_to_bf16_N1024": lambda: cast_bf16_f32_kernel(N=1024, src_dtype=FP32, dst_dtype=BF16),
 
     "indexer_causal_adjust_topk512": lambda: indexer_causal_adjust_kernel(topk=512),
 
     "scale_f32_N4096": lambda: scale_f32_kernel(N=4096),
+    "scale_f32_N64": lambda: scale_f32_kernel(N=64),
 
-    "compressor_group_d128_od1024_ps8": lambda: compressor_group_kernel(d=128, out_dim=1024, pool_size=8),
-    "compressor_group_d128_od1024_ps16": lambda: compressor_group_kernel(d=128, out_dim=1024, pool_size=16),
+    "compressor_group_d512_od1024_ps8": lambda: compressor_group_kernel(d=512, out_dim=1024, pool_size=8),
+    "compressor_group_d128_od256_ps8": lambda: compressor_group_kernel(d=128, out_dim=256, pool_size=8),
 
     "moe_gather_D4096": lambda: moe_gather_kernel(D=4096),
     "moe_extract_weights_topk6": lambda: moe_extract_weights_kernel(topk=6),
 
     "moe_expert_count_topk6_ne256": lambda: moe_expert_count_kernel(topk=6, n_experts=256),
+
+    "fused_shared_ffn_D4096_I2048": lambda: fused_shared_ffn_kernel(Inter=2048, Dim=4096, K=4096, scale_dtype=FE8M0, swiglu_limit=10.0),
 }
 
 BATCH_A1 = [k for k in KERNEL_INSTANCES if k.startswith("act_quant_") or k.startswith("fp8_gemm_") or k.startswith("sparse_attn_") or k.startswith("hc_sinkhorn_") or k.startswith("hc_sigmoid_")]
-BATCH_A2 = [k for k in KERNEL_INSTANCES if k.startswith("rmsnorm_") or k.startswith("swiglu_") or k.startswith("rope_")]
+BATCH_A2 = [k for k in KERNEL_INSTANCES if k.startswith("rmsnorm_") or k.startswith("swiglu_") or k.startswith("rope_") or k.startswith("mul_row_broadcast")]
 BATCH_A3 = [k for k in KERNEL_INSTANCES if k.startswith("cast_")]
 BATCH_B1 = [k for k in KERNEL_INSTANCES if k.startswith("fp4_gemm_")]
 
@@ -1348,6 +1582,23 @@ def make_dummy_inputs(name):
         post = torch.empty(n, hc, dtype=torch.float32, device=device)
         comb = torch.empty(n, hc, hc, dtype=torch.float32, device=device)
         return [mixes, hc_scale, hc_base, pre, post, comb]
+    elif name.startswith("rmsnorm_f32_weighted_"):
+        N = int(name.split("_N")[1])
+        X = torch.randn(M, N, dtype=torch.float32, device=device)
+        W = torch.ones(N, dtype=torch.float32, device=device)
+        Y = torch.empty(M, N, dtype=torch.float32, device=device)
+        return [X, W, Y]
+    elif name.startswith("rmsnorm_rsqrt_f32_"):
+        N = int(name.split("_N")[1].split("_")[0])
+        X = torch.randn(M, N, dtype=torch.float32, device=device)
+        R = torch.empty(M, 1, dtype=torch.float32, device=device)
+        return [X, R]
+    elif name.startswith("mul_row_broadcast_f32"):
+        N = 24
+        Mat = torch.randn(M, N, dtype=torch.float32, device=device)
+        Vec = torch.randn(M, 1, dtype=torch.float32, device=device)
+        Out = torch.empty(M, N, dtype=torch.float32, device=device)
+        return [Mat, Vec, Out]
     elif name.startswith("rmsnorm_f32_"):
         N = int(name.split("_N")[1].split("_")[0])
         X = torch.randn(M, N, dtype=torch.float32, device=device)
@@ -1496,7 +1747,7 @@ def make_dummy_inputs(name):
         d = int(parts[2][1:])
         out_dim = int(parts[3][2:])
         pool_size = int(parts[4][2:])
-        ratio = pool_size // 2 if pool_size > 8 else pool_size
+        ratio = pool_size // 2 if out_dim == 2 * d else pool_size
         N = M * ratio * 2
         Src = torch.randn(N, out_dim, dtype=torch.float32, device=device)
         Ape = torch.randn(ratio, out_dim, dtype=torch.float32, device=device)
@@ -1531,6 +1782,17 @@ def make_dummy_inputs(name):
         Indices = torch.randint(0, n_experts, (Total, topk), dtype=torch.int32, device=device)
         Counts = torch.zeros(n_experts, dtype=torch.int32, device=device)
         return [Indices, Counts]
+    elif name.startswith("fused_shared_ffn_"):
+        parts = name.split("_")
+        Dim = int(parts[3][1:])
+        Inter = int(parts[4][1:])
+        K = Dim
+        Gate = torch.randn(M, Inter, dtype=torch.bfloat16, device=device)
+        Up = torch.randn(M, Inter, dtype=torch.bfloat16, device=device)
+        W2 = torch.randn(Dim, Inter, dtype=torch.bfloat16, device=device).to(torch.float8_e4m3fn)
+        W2_S = torch.ones(Dim // 128, Inter // 128, dtype=torch.float8_e8m0fnu, device=device)
+        Y = torch.empty(M, Dim, dtype=torch.bfloat16, device=device)
+        return [Gate, Up, W2, W2_S, Y]
     else:
         return None
 
@@ -1637,6 +1899,10 @@ def _get_func_name(name):
         return "hc_split_sinkhorn_kernel_"
     elif name.startswith("rmsnorm_f32_weighted_"):
         return "rmsnorm_f32_weighted_kernel_"
+    elif name.startswith("rmsnorm_rsqrt_f32_"):
+        return "rmsnorm_rsqrt_f32_kernel_"
+    elif name.startswith("mul_row_broadcast_f32"):
+        return "mul_row_broadcast_f32_kernel_"
     elif name.startswith("rmsnorm_f32_"):
         return "rmsnorm_f32_kernel_"
     elif name.startswith("rmsnorm_"):
@@ -1671,12 +1937,16 @@ def _get_func_name(name):
         return "scale_f32_kernel_"
     elif name.startswith("compressor_group_"):
         return "compressor_group_kernel_"
+    elif name.startswith("cast_"):
+        return "cast_bf16_f32_kernel_"
     elif name.startswith("moe_gather_"):
         return "moe_gather_kernel_"
     elif name.startswith("moe_extract_weights_"):
         return "moe_extract_weights_kernel_"
     elif name.startswith("moe_expert_count_"):
         return "moe_expert_count_kernel_"
+    elif name.startswith("fused_shared_ffn_"):
+        return "fused_shared_ffn_kernel_"
     else:
         return name + "_"
 

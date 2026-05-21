@@ -32,7 +32,7 @@ impl CpuTensor {
 }
 
 pub struct GpuTensor {
-    pub slice: CudaSlice<u8>,
+    pub slice: Arc<CudaSlice<u8>>,
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub device: Arc<CudaContext>,
@@ -40,16 +40,8 @@ pub struct GpuTensor {
 
 impl Clone for GpuTensor {
     fn clone(&self) -> Self {
-        let stream = self.device.default_stream();
-        let nbytes = self.nbytes();
-        let mut new_slice = stream
-            .alloc_zeros::<u8>(nbytes)
-            .expect("GPU alloc failed in clone");
-        stream
-            .memcpy_dtod(&self.slice, &mut new_slice)
-            .expect("D2D copy failed in clone");
         Self {
-            slice: new_slice,
+            slice: Arc::clone(&self.slice),
             shape: self.shape.clone(),
             dtype: self.dtype,
             device: self.device.clone(),
@@ -65,7 +57,7 @@ impl GpuTensor {
             .alloc_zeros::<u8>(nbytes)
             .map_err(|e| anyhow!("GPU alloc failed: {:?}", e))?;
         Ok(Self {
-            slice,
+            slice: Arc::new(slice),
             shape,
             dtype,
             device,
@@ -80,7 +72,7 @@ impl GpuTensor {
             .memcpy_stod(&cpu.data)
             .map_err(|e| anyhow!("H2D copy failed: {:?}", e))?;
         Ok(Self {
-            slice,
+            slice: Arc::new(slice),
             shape,
             dtype,
             device,
@@ -90,7 +82,7 @@ impl GpuTensor {
     pub fn to_host(&self) -> Result<CpuTensor> {
         let stream = self.device.default_stream();
         let host_data = stream
-            .memcpy_dtov(&self.slice)
+            .memcpy_dtov(&*self.slice)
             .map_err(|e| anyhow!("D2H copy failed: {:?}", e))?;
         Ok(CpuTensor {
             data: host_data,
@@ -166,7 +158,7 @@ impl GpuTensor {
         }
 
         Ok(Self {
-            slice,
+            slice: Arc::new(slice),
             shape,
             dtype,
             device,
@@ -202,7 +194,7 @@ impl GpuTensor {
         }
 
         Ok(Self {
-            slice,
+            slice: Arc::new(slice),
             shape,
             dtype,
             device,
@@ -308,6 +300,34 @@ impl GpuTensor {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub fn copy_into_at_async(
+        &self,
+        dst: &mut GpuTensor,
+        dst_offset_bytes: usize,
+        stream: &cudarc::driver::CudaStream,
+    ) -> Result<()> {
+        let src_nbytes = self.nbytes();
+        if dst_offset_bytes + src_nbytes > dst.nbytes() {
+            return Err(anyhow!(
+                "copy_into_at_async: src {} + offset {} > dst {}",
+                src_nbytes, dst_offset_bytes, dst.nbytes()
+            ));
+        }
+        let default_stream = self.device.default_stream();
+        let (src_ptr, _src_guard) = self.slice.device_ptr(&default_stream);
+        let (dst_ptr, _dst_guard) = dst.slice.device_ptr(&default_stream);
+        unsafe {
+            cudarc::driver::sys::cuMemcpyAsync(
+                dst_ptr + dst_offset_bytes as u64,
+                src_ptr,
+                src_nbytes as usize,
+                stream.cu_stream() as *mut _,
+            );
+        }
+        Ok(())
+    }
+
     pub fn d2d_scatter_rows(
         src: &GpuTensor,
         dst: &mut GpuTensor,
@@ -339,6 +359,65 @@ impl GpuTensor {
             }
         }
         stream.synchronize()?;
+        Ok(())
+    }
+
+    pub fn d2d_copy_within(
+        tensor: &mut GpuTensor,
+        src_offset_bytes: usize,
+        dst_offset_bytes: usize,
+        copy_bytes: usize,
+    ) -> Result<()> {
+        if src_offset_bytes + copy_bytes > tensor.nbytes() {
+            return Err(anyhow!("d2d_copy_within: src_off {} + copy {} > nbytes {}", src_offset_bytes, copy_bytes, tensor.nbytes()));
+        }
+        if dst_offset_bytes + copy_bytes > tensor.nbytes() {
+            return Err(anyhow!("d2d_copy_within: dst_off {} + copy {} > nbytes {}", dst_offset_bytes, copy_bytes, tensor.nbytes()));
+        }
+        let default_stream = tensor.device.default_stream();
+        let (ptr, _guard) = tensor.slice.device_ptr(&default_stream);
+        unsafe {
+            cudarc::driver::sys::cuMemcpyAsync(
+                ptr + dst_offset_bytes as u64,
+                ptr + src_offset_bytes as u64,
+                copy_bytes,
+                default_stream.cu_stream() as *mut _,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn d2d_scatter_rows_async(
+        src: &GpuTensor,
+        dst: &mut GpuTensor,
+        src_batch_stride_bytes: usize,
+        dst_batch_stride_bytes: usize,
+        copy_bytes_per_batch: usize,
+        dst_offset_bytes: usize,
+        n_batches: usize,
+        stream: &cudarc::driver::CudaStream,
+    ) -> Result<()> {
+        let default_stream = src.device.default_stream();
+        let (src_ptr, _src_guard) = src.slice.device_ptr(&default_stream);
+        let (dst_ptr, _dst_guard) = dst.slice.device_ptr(&default_stream);
+        for b in 0..n_batches {
+            let src_off = b * src_batch_stride_bytes;
+            let dst_off = b * dst_batch_stride_bytes + dst_offset_bytes;
+            if dst_off + copy_bytes_per_batch > dst.nbytes() {
+                return Err(anyhow!(
+                    "d2d_scatter_rows_async: batch {} dst_off {} + copy {} > dst {}",
+                    b, dst_off, copy_bytes_per_batch, dst.nbytes()
+                ));
+            }
+            unsafe {
+                cudarc::driver::sys::cuMemcpyAsync(
+                    dst_ptr + dst_off as u64,
+                    src_ptr + src_off as u64,
+                    copy_bytes_per_batch,
+                    stream.cu_stream() as *mut _,
+                );
+            }
+        }
         Ok(())
     }
 }

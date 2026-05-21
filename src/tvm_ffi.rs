@@ -1,4 +1,4 @@
-use crate::dlpack::{DLDevice, DLTensor};
+use crate::dlpack::{DLDevice, DLManagedTensor, DLTensor};
 use crate::tensor::GpuTensor;
 use anyhow::{anyhow, Context, Result};
 use libloading::os::unix::Library as UnixLibrary;
@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 const K_TVMFFI_NONE: i32 = 0;
 const K_TVMFFI_BOOL: i32 = 2;
 const K_TVMFFI_RAW_STR: i32 = 8;
-const K_TVMFFI_DL_TENSOR_PTR: i32 = 7;
 const K_TVMFFI_FUNCTION: i32 = 68;
 const K_TVMFFI_MODULE: i32 = 73;
+const K_TVMFFI_TENSOR: i32 = 70;
 
 #[repr(C)]
 struct TVMFFIAny {
@@ -38,10 +38,6 @@ impl TVMFFIAny {
     fn from_object(type_index: i32, handle: i64) -> Self {
         Self { type_index, zero_padding: 0, v_int64: handle }
     }
-
-    fn from_dl_tensor_ptr(ptr: *const DLTensor) -> Self {
-        Self { type_index: K_TVMFFI_DL_TENSOR_PTR, zero_padding: 0, v_int64: ptr as i64 }
-    }
 }
 
 #[repr(C)]
@@ -55,6 +51,7 @@ type FnFunctionCall = unsafe extern "C" fn(*mut c_void, *const TVMFFIAny, i32, *
 type FnObjectIncRef = unsafe extern "C" fn(*mut c_void) -> i32;
 type FnObjectDecRef = unsafe extern "C" fn(*mut c_void) -> i32;
 type FnErrorMoveFromRaised = unsafe extern "C" fn(*mut *mut c_void);
+type FnTensorFromDLPack = unsafe extern "C" fn(*const DLManagedTensor, i32, i32, *mut *mut c_void) -> i32;
 
 struct TvmCApi {
     get_global: FnGetGlobal,
@@ -62,6 +59,7 @@ struct TvmCApi {
     object_inc_ref: FnObjectIncRef,
     object_dec_ref: FnObjectDecRef,
     error_move_from_raised: FnErrorMoveFromRaised,
+    tensor_from_dlpack: FnTensorFromDLPack,
     _deps: Vec<Library>,
     _lib: Library,
 }
@@ -101,12 +99,17 @@ impl TvmCApi {
                 .get(b"TVMFFIErrorMoveFromRaised\0")
                 .with_context(|| "TVMFFIErrorMoveFromRaised not found")?;
 
+            let tensor_from_dlpack: FnTensorFromDLPack = *lib
+                .get(b"TVMFFITensorFromDLPack\0")
+                .with_context(|| "TVMFFITensorFromDLPack not found")?;
+
             Ok(Self {
                 get_global,
                 function_call,
                 object_inc_ref,
                 object_dec_ref,
                 error_move_from_raised,
+                tensor_from_dlpack,
                 _deps: Vec::new(),
                 _lib: lib,
             })
@@ -269,9 +272,70 @@ pub struct TlKernel {
     _module: TvmModuleHandle,
     func: TvmFuncHandle,
     api: Arc<TvmCApi>,
+    name: String,
+    expected_nargs: usize,
+    _dlopen_guard: Option<libloading::Library>,
 }
 
 impl TlKernel {
+fn infer_nargs(func_name: &str) -> usize {
+        if func_name.starts_with("fp8_gemm_kernel_") || func_name.starts_with("fp4_gemm_kernel_") {
+            5
+        } else if func_name.starts_with("act_quant_kernel_") {
+            3
+        } else if func_name.starts_with("sparse_attn_kernel_") {
+            5
+        } else if func_name.starts_with("hc_split_sinkhorn_kernel_") {
+            6
+        } else if func_name.starts_with("rmsnorm_kernel_") {
+            3
+        } else if func_name.starts_with("rmsnorm_f32_kernel_") {
+            2
+        } else if func_name.starts_with("rmsnorm_f32_weighted_kernel_") {
+            3
+        } else if func_name.starts_with("swiglu_kernel_") {
+            3
+        } else if func_name.starts_with("rope_interleaved_kernel_") {
+            4
+        } else if func_name.starts_with("rotary_emb_kernel_") {
+            5
+        } else if func_name.starts_with("cast_bf16_f32_kernel_") {
+            2
+        } else if func_name.starts_with("scatter_add_kernel_") {
+            4
+        } else if func_name.starts_with("sigmoid_kernel_") {
+            4
+        } else if func_name.starts_with("hc_sigmoid_kernel_") {
+            4
+        } else if func_name.starts_with("moe_route_kernel_") {
+            4
+        } else if func_name.starts_with("indexer_score_kernel_") {
+            4
+        } else if func_name.starts_with("compressor_pool_kernel_") {
+            3
+        } else if func_name.starts_with("compressor_rope_f32_kernel_") {
+            4
+        } else if func_name.starts_with("fp4_qdq_f32_kernel_") || func_name.starts_with("fp4_quant_kernel_") {
+            3
+        } else if func_name.starts_with("indexer_causal_adjust_kernel_") {
+            4
+        } else if func_name.starts_with("scale_f32_kernel_") {
+            3
+        } else if func_name.starts_with("compressor_group_kernel_") {
+            6
+        } else if func_name.starts_with("moe_gather_kernel_") {
+            3
+        } else if func_name.starts_with("moe_extract_weights_kernel_") {
+            6
+        } else if func_name.starts_with("moe_expert_count_kernel_") {
+            2
+        } else if func_name.starts_with("fused_shared_ffn_kernel_") {
+            5
+        } else {
+            0
+        }
+    }
+
     pub fn load(runtime: &TvmRuntime, so_path: &str, func_name: &str) -> Result<Self> {
         unsafe {
             let api = &runtime.api;
@@ -283,11 +347,7 @@ impl TlKernel {
 
             let result = api.call_function(load_func, &[arg_path])?;
             if result.type_index != K_TVMFFI_MODULE {
-                return Err(anyhow!(
-                    "ModuleLoadFromFile returned type_index={}, expected {}",
-                    result.type_index,
-                    K_TVMFFI_MODULE
-                ));
+                return Self::load_via_dlopen(runtime, so_path, func_name);
             }
             let module_handle = result.v_int64 as *mut c_void;
             api.inc_ref(module_handle);
@@ -320,30 +380,119 @@ impl TlKernel {
                     api: Arc::clone(api),
                 },
                 api: Arc::clone(api),
+                name: func_name.to_string(),
+                expected_nargs: Self::infer_nargs(func_name),
+                _dlopen_guard: None,
+            })
+        }
+    }
+
+    fn load_via_dlopen(runtime: &TvmRuntime, so_path: &str, func_name: &str) -> Result<Self> {
+        unsafe {
+            let api = &runtime.api;
+            let library = libloading::Library::new(so_path)
+                .with_context(|| format!("dlopen failed for {}", so_path))?;
+
+            let main_sym: Result<libloading::Symbol<unsafe extern "C" fn()>, _> =
+                library.get(b"__tvm_ffi_main\0");
+            if let Ok(sym) = main_sym {
+                sym();
+            }
+
+            let global_name = format!("{}\0", func_name);
+            let func_handle = api.get_global_func(global_name.as_bytes())?;
+
+            let module_handle = std::ptr::null_mut();
+
+            Ok(Self {
+                _module: TvmModuleHandle {
+                    handle: module_handle,
+                    api: Arc::clone(api),
+                },
+                func: TvmFuncHandle {
+                    handle: func_handle,
+                    api: Arc::clone(api),
+                },
+                api: Arc::clone(api),
+                name: func_name.to_string(),
+                expected_nargs: Self::infer_nargs(func_name),
+                _dlopen_guard: Some(library),
             })
         }
     }
 
     pub fn call(&self, tensors: &[&GpuTensor]) -> Result<()> {
+        if self.expected_nargs > 0 && tensors.len() != self.expected_nargs {
+            return Err(anyhow!(
+                "kernel {}: expected {} args, got {}",
+                self.name, self.expected_nargs, tensors.len()
+            ));
+        }
         unsafe {
-            let mut dl_tensors: Vec<DLTensor> = Vec::with_capacity(tensors.len());
+            let mut managed_tensors: Vec<DLManagedTensor> = Vec::with_capacity(tensors.len());
+            let mut shape_storage: Vec<Vec<i64>> = Vec::with_capacity(tensors.len());
+            let mut tensor_handles: Vec<*mut c_void> = Vec::with_capacity(tensors.len());
 
             for tensor in tensors {
-                let dl = DLTensor::new(
-                    tensor.device_ptr(),
-                    tensor.shape.as_slice(),
-                    tensor.dtype,
-                    DLDevice::cuda(0),
+                let shape_i64: Vec<i64> = tensor.shape.iter().map(|&s| s as i64).collect();
+                let dl_dtype = crate::dlpack::DLDataType::from_dtype(tensor.dtype);
+
+                shape_storage.push(shape_i64);
+
+                let dlt = DLTensor {
+                    data: tensor.device_ptr() as *mut c_void,
+                    device: DLDevice::cuda(0),
+                    ndim: tensor.shape.len() as i32,
+                    dtype: dl_dtype,
+                    shape: shape_storage.last().unwrap().as_ptr() as *mut i64,
+                    strides: std::ptr::null_mut(),
+                    byte_offset: 0,
+                };
+
+                let managed = DLManagedTensor {
+                    dl_tensor: dlt,
+                    manager_ctx: std::ptr::null_mut(),
+                    deleter: None,
+                };
+                managed_tensors.push(managed);
+
+                let mut handle: *mut c_void = std::ptr::null_mut();
+                let ret = (self.api.tensor_from_dlpack)(
+                    managed_tensors.last().unwrap(),
+                    0,
+                    0,
+                    &mut handle,
                 );
-                dl_tensors.push(dl);
+                if ret != 0 || handle.is_null() {
+                    return Err(anyhow!(
+                        "TVMFFITensorFromDLPack failed (ret={}, handle={:?}, dtype=({},{},{}))",
+                        ret,
+                        handle,
+                        dl_dtype.code,
+                        dl_dtype.bits,
+                        dl_dtype.lanes
+                    ));
+                }
+
+                tensor_handles.push(handle);
             }
 
-            let args: Vec<TVMFFIAny> = dl_tensors
+            let args: Vec<TVMFFIAny> = tensor_handles
                 .iter()
-                .map(|dl| TVMFFIAny::from_dl_tensor_ptr(dl))
+                .map(|&handle| TVMFFIAny {
+                    type_index: K_TVMFFI_TENSOR,
+                    zero_padding: 0,
+                    v_int64: handle as i64,
+                })
                 .collect();
 
-            self.api.call_function(self.func.handle, &args)?;
+            let result = self.api.call_function(self.func.handle, &args)?;
+
+            for &handle in &tensor_handles {
+                self.api.dec_ref(handle);
+            }
+
+            let _ = result;
             Ok(())
         }
     }
@@ -374,7 +523,16 @@ impl KernelRegistry {
         let kernel = kernels
             .get(name)
             .ok_or_else(|| anyhow!("kernel {} not found in registry", name))?;
-        kernel.call(tensors)
+        kernel.call(tensors).with_context(|| {
+            let shapes: Vec<String> = tensors.iter()
+                .map(|t| format!("{:?}{:?}", t.shape, t.dtype))
+                .collect();
+            format!("kernel {} call failed, tensor shapes: {:?}", name, shapes)
+        })
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.kernels.lock().unwrap().contains_key(name)
     }
 
     pub fn load_dir(&self, dir: &str) -> Result<usize> {
@@ -431,6 +589,28 @@ impl KernelRegistry {
                     count += 1;
                 }
                 Err(e) => { eprintln!("warning: failed to load kernel {}: {}", so_path, e); }
+            }
+        }
+
+        let dir_path = Path::new(dir);
+        for entry in std::fs::read_dir(dir_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "so") {
+                let filename = path.file_name().unwrap().to_string_lossy().to_string();
+                let kernel_name = filename.trim_end_matches(".so").to_string();
+                if self.kernels.lock().unwrap().contains_key(&kernel_name) {
+                    continue;
+                }
+                let func_name = kernel_name.clone() + "_";
+                let so_path = path.to_string_lossy().to_string();
+                match TlKernel::load(&self.runtime, &so_path, &func_name) {
+                    Ok(kernel) => {
+                        self.kernels.lock().unwrap().insert(kernel_name, kernel);
+                        count += 1;
+                    }
+                    Err(e) => { eprintln!("warning: failed to load kernel {}: {}", so_path, e); }
+                }
             }
         }
         Ok(count)

@@ -2,23 +2,89 @@
 
 DeepSeek V4 Flash 专用单机推理引擎，基于 96G DDR5 + RTX 5060 Ti 16G 定制开发。
 
+## 性能指标
+
+| 指标 | 值 |
+|------|-----|
+| 推理速度 | 1.0-1.25 t/s (decode) |
+| GPU VRAM | 12.6 GB (常驻 + 200专家缓存) |
+| 系统内存 | ~6 GB (稳定，无泄漏) |
+| 模型权重 | 149 GB (FP4) |
+| 缓存命中率 | L1 GPU 0% (warmup后提升) |
+
 ## 架构概览
 
 ```
 ┌─────────────────────────────────────────────┐
 │  GPU VRAM (16GB)                            │
-│  常驻: 非路由专家 + KV Cache + 热点路由专家  │
-│  空闲槽位: 预取目标                          │
+│  ┌─────────────────────────────────────┐    │
+│  │ 常驻: 非路由专家 + KV Cache +       │    │
+│  │       热点路由专家 (LFU Top-200)     │    │
+│  └─────────────────────────────────────┘    │
+│  ┌─────────────────────────────────────┐    │
+│  │ 空闲槽位: 非缓存专家计算 (~3GB)      │    │
+│  └─────────────────────────────────────┘    │
 └──────────────────┬──────────────────────────┘
                 │ PCIe 5.0 x8 (~16 GB/s)
+                │ Direct I/O (非 mmap)
 ┌──────────────────┴──────────────────────────┐
 │  Host RAM (96GB DDR5)                       │
-│  Pinned Memory Pool (SLRU Cache)            │
+│  ┌─────────────────────────────────────┐    │
+│  │ 模型常驻权重 + OS (~40GB)           │    │
+│  │ L2 CPU 缓存: 禁用 (避免内存膨胀)     │    │
+│  └─────────────────────────────────────┘    │
 └──────────────────┬──────────────────────────┘
-                │ SSD MMAP 预取
+                │ safetensors 直接读取
 ┌──────────────────┴──────────────────────────┐
-│  SSD: 全量路由专家权重                       │
+│  SSD: 全量路由专家权重 (149GB)              │
 └─────────────────────────────────────────────┘
+```
+
+## 快速开始
+
+### Python 推理 (inference/)
+
+```bash
+# 进入容器
+docker exec -it ds4rs-dev bash
+
+# 运行推理
+cd /workspace/inference
+python3 generate.py --ckpt-path /models --config /models/config.json \
+    --interactive --max-new-tokens 100 --temperature 0.6
+
+# 或使用 Python API
+python3 -c "
+from model import Transformer, ModelArgs
+from generate import load_weights_streaming, generate
+from transformers import AutoTokenizer
+import json, torch
+
+torch.set_default_dtype(torch.bfloat16)
+torch.cuda.set_device(0)
+
+with open('/models/config.json') as f:
+    raw = json.load(f)
+# ... 字段映射见 generate.py main() ...
+
+with torch.device('cpu'):
+    model = Transformer(args)
+
+load_weights_streaming(model, '/models', 0, 1)
+torch.set_default_device('cuda')
+
+tokenizer = AutoTokenizer.from_pretrained('/models')
+tokens = tokenizer.encode('你好')
+out = generate(model, [tokens], 50, tokenizer.eos_token_id, temperature=0.6)
+print(tokenizer.decode(out[0]))
+"
+```
+
+### Rust 推理 (待实现)
+
+```bash
+make build
+./target/release/ds4_cli --model /models --prompt "Hello"
 ```
 
 ## 推理全流程
@@ -28,7 +94,7 @@ Input Tokens
     │
     ▼
 ┌──────────────────────────────────────────────────────┐
-│  Transformer Layer (×61)                              │
+│  Transformer Layer (×43)                              │
 │  ┌──────────┐   ┌───────────────────┐   ┌─────────┐ │
 │  │ RMSNorm  │──▶│ Hybrid Attention  │──▶│ Residual│ │
 │  └──────────┘   │ (SWA+CSA+HCA)     │   │ (HC)    │ │
@@ -48,18 +114,24 @@ Input Tokens
 1. **Prefill**: Token序列 → RMSNorm → QKV投影 → Hybrid Attention(SWA滑动窗口 + CSA压缩注意力 + HCA层级注意力) → MoE(共享专家 + 路由专家)
 2. **Decode**: 单Token → 同上路径，KV Cache环形缓冲区管理
 
-### Compressor/Indexer 数据流
+### MoE 专家加载流程
 
 ```
-KV/Scores → Pool(softmax weighted) → RMSNorm(weighted) → RoPE → Hadamard → FP4-QDQ → BF16
-                                                              ↓
-                                                        Compressed KV Cache
-```
-
-```
-Query → Q投影 → RoPE → Hadamard → FP4-QDQ
-                                    ↓
-Indexer: Score(Q, CompressedKV) × Weights → TopK → Causal Adjust → Index
+MoE.forward(x, input_ids)
+    │
+    ├─▶ Gate 计算: weights, indices = gate(x, input_ids)
+    │
+    ├─▶ 统计激活专家: activated = torch.unique(indices).tolist()
+    │
+    ├─▶ _on_experts_needed(activated)  ← 三级缓存加载
+    │       │
+    │       ├─▶ L1 GPU 缓存命中? → 设置参数到 Expert (0ms)
+    │       │
+    │       └─▶ L3 SSD 读取? → 直接 I/O + H2D (~30ms)
+    │
+    ├─▶ 专家计算: for i in activated: y += expert(x)
+    │
+    └─▶ _on_experts_done(activated)  ← 删除非 GPU 缓存 Expert 对象
 ```
 
 ## 技术架构
@@ -84,6 +156,15 @@ Indexer: Score(Q, CompressedKV) × Weights → TopK → Causal Adjust → Index
 | cuBLAS | `cublas.rs` | GEMM矩阵运算封装 |
 | DLPack | `dlpack.rs` | 跨框架张量协议 |
 
+### Python 推理模块
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| 模型 | `inference/model.py` | Transformer、MoE、Attention 定义 |
+| 生成 | `inference/generate.py` | 流式加载、两级缓存、生成循环 |
+| 内核 | `inference/kernel.py` | TileLang GPU 内核封装 |
+| 转换 | `inference/convert.py` | 权重格式转换 (FP4/FP8) |
+
 ### TileLang 内核
 
 | 内核 | 功能 |
@@ -98,6 +179,8 @@ Indexer: Score(Q, CompressedKV) × Weights → TopK → Causal Adjust → Index
 | `indexer_causal_adjust_*` | 因果掩码+偏移调整 |
 | `compressor_group_*` | Compressor分组(gather+slice+ape) |
 | `scale_f32_*` | 元素级缩放 |
+| `fp4_gemm_*` | FP4 GEMM (激活FP8 × 权重FP4) |
+| `fp8_gemm_*` | FP8 GEMM |
 
 ### GPU化路径
 
@@ -118,16 +201,34 @@ Indexer: Score(Q, CompressedKV) × Weights → TopK → Causal Adjust → Index
 
 替代传统残差连接，通过可学习门控实现动态特征融合。
 
-### MoE 三级缓存
+### MoE 两级缓存
 
-路由专家权重按需加载，通过GPU/内存/SSD三级缓存隐藏PCIe传输延迟：
-- GPU: LFU热点专家常驻
-- 内存: Pinned Memory SLRU缓存
-- SSD: MMAP全量专家预取
+路由专家权重按需加载，通过GPU/SSD两级缓存隐藏PCIe传输延迟：
+
+| 缓存层 | 容量 | 策略 | 延迟 |
+|--------|------|------|------|
+| L1 GPU | 200 专家 (~2.5GB) | LFU | 0ms |
+| L3 SSD | 全量 11008 专家 | 直接 I/O | ~30ms |
+
+**关键设计决策**：
+- **L2 CPU 缓存禁用**: pinned memory 会锁定物理页，96GB 内存中模型常驻权重 + OS 已占 ~40GB，剩余空间不足以缓存大量专家。且旧方案将 GPU 参数移到 CPU 保留导致内存泄漏。
+- **Expert 对象卸载策略**: 非缓存专家计算完后直接删除 Expert 对象（设为 None），而非移到 CPU。下次需要时由 `_ensure_expert` 重建空壳，缓存重新加载权重。
+- **直接 I/O 而非 mmap**: safetensors mmap 会导致 OS 页缓存膨胀（46 个分片 × 3.4GB ≈ 156GB 潜力），改用 `seek/read` 直接读取所需字节。
 
 ### FP4 量化
 
 路由专家权重以FP4 e2m1fn格式存储(int8打包)，按行每32列一组FP8 e8m0fnu缩放因子。
+
+**存储格式**：
+- 数据类型：FP4 e2m1fn (1符号位 + 2指数位 + 1尾数位)
+- 打包密度：2个FP4值 → 1个int8字节
+- 缩放因子：FP8 e8m0fnu，按行、每32列一组
+
+### 内存安全机制
+
+- **内存水位监控**: 每 10 个 token 检查 `/proc/meminfo`，可用内存 < 8GB 时触发紧急清理
+- **紧急清理**: 释放 safetensors header 缓存、强制 GC、清空 CUDA 缓存
+- **自动 warmup**: 启动时执行短推理收集 LFU 统计，将 top-200 热点专家常驻 GPU
 
 ## 构建与测试
 
@@ -146,6 +247,11 @@ make test
 
 # 详细测试输出
 make dev-test
+
+# Python 推理测试
+cd /workspace/inference
+python3 generate.py --ckpt-path /models --config /models/config.json \
+    --interactive --max-new-tokens 50 --temperature 0.6
 ```
 
 ## 依赖
@@ -156,3 +262,5 @@ make dev-test
 - TileLang >= 0.1.9 (内核编译)
 - cudarc 0.17 (CUDA驱动)
 - safetensors 0.7 (权重加载)
+- PyTorch >= 2.5 (Python 推理)
+- transformers (分词器)

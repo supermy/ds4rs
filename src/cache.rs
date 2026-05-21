@@ -1,7 +1,6 @@
 use crate::config::ModelConfig;
 use crate::expert::ExpertWeights;
 use crate::pinned::PinnedBuffer;
-use crate::tensor::GpuTensor;
 use anyhow::{anyhow, Result};
 use cudarc::driver::CudaContext;
 use std::collections::HashMap;
@@ -56,12 +55,7 @@ pub struct GpuExpertCache {
 }
 
 struct GpuExpertSlot {
-    w1: GpuTensor,
-    w1_scale: GpuTensor,
-    w3: GpuTensor,
-    w3_scale: GpuTensor,
-    w2: GpuTensor,
-    w2_scale: GpuTensor,
+    weights: Arc<ExpertWeights>,
 }
 
 impl GpuExpertCache {
@@ -80,7 +74,7 @@ impl GpuExpertCache {
         }
     }
 
-    pub fn get(&mut self, layer_id: usize, expert_id: usize) -> Option<ExpertWeights> {
+    pub fn get(&mut self, layer_id: usize, expert_id: usize) -> Option<Arc<ExpertWeights>> {
         let key = (layer_id, expert_id);
         if self.slots.contains_key(&key) {
             *self.freq.entry(key).or_insert(0) += 1;
@@ -88,21 +82,14 @@ impl GpuExpertCache {
             *self.last_access.entry(key).or_insert(0) = self.access_counter;
             self.stats.record_hit();
             let slot = self.slots.get(&key)?;
-            Some(ExpertWeights {
-                w1: slot.w1.clone(),
-                w1_scale: slot.w1_scale.clone(),
-                w3: slot.w3.clone(),
-                w3_scale: slot.w3_scale.clone(),
-                w2: slot.w2.clone(),
-                w2_scale: slot.w2_scale.clone(),
-            })
+            Some(Arc::clone(&slot.weights))
         } else {
             self.stats.record_miss();
             None
         }
     }
 
-    pub fn put(&mut self, layer_id: usize, expert_id: usize, weights: ExpertWeights) -> Result<()> {
+    pub fn put(&mut self, layer_id: usize, expert_id: usize, weights: Arc<ExpertWeights>) -> Result<()> {
         let key = (layer_id, expert_id);
 
         if self.slots.len() >= self.max_slots && !self.slots.contains_key(&key) {
@@ -112,14 +99,7 @@ impl GpuExpertCache {
         self.access_counter += 1;
         *self.last_access.entry(key).or_insert(0) = self.access_counter;
 
-        self.slots.insert(key, GpuExpertSlot {
-            w1: weights.w1,
-            w1_scale: weights.w1_scale,
-            w3: weights.w3,
-            w3_scale: weights.w3_scale,
-            w2: weights.w2,
-            w2_scale: weights.w2_scale,
-        });
+        self.slots.insert(key, GpuExpertSlot { weights });
         *self.freq.entry(key).or_insert(1) += 1;
 
         Ok(())
@@ -129,8 +109,19 @@ impl GpuExpertCache {
         self.slots.contains_key(&(layer_id, expert_id))
     }
 
+    pub fn evict(&mut self, layer_id: usize, expert_id: usize) {
+        let key = (layer_id, expert_id);
+        self.slots.remove(&key);
+        self.freq.remove(&key);
+        self.last_access.remove(&key);
+    }
+
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
     }
 
     pub fn max_capacity(&self) -> usize {
@@ -176,8 +167,21 @@ impl GpuExpertCache {
         Ok(())
     }
 
+    pub fn evict_until(&mut self, target_slots: usize) -> Result<()> {
+        while self.slots.len() > target_slots {
+            self.evict_lfu()?;
+        }
+        Ok(())
+    }
+
     pub fn prefetch_slots(&self) -> usize {
         self.max_slots.saturating_sub(self.slots.len())
+    }
+
+    pub fn clear(&mut self) {
+        self.slots.clear();
+        self.freq.clear();
+        self.last_access.clear();
     }
 }
 
@@ -275,6 +279,12 @@ impl RamExpertCache {
         } else if self.cold_size + size <= self.cold_capacity {
             self.cold.insert(key, entry);
             self.cold_size += size;
+        } else {
+            self.evict_cold_lfu();
+            if self.cold_size + size <= self.cold_capacity {
+                self.cold.insert(key, entry);
+                self.cold_size += size;
+            }
         }
     }
 
@@ -329,6 +339,22 @@ impl RamExpertCache {
             }
         }
     }
+
+    fn evict_cold_lfu(&mut self) {
+        let mut min_freq = u64::MAX;
+        let mut evict_key = None;
+        for (&key, entry) in &self.cold {
+            if entry.freq < min_freq {
+                min_freq = entry.freq;
+                evict_key = Some(key);
+            }
+        }
+        if let Some(key) = evict_key {
+            if let Some(entry) = self.cold.remove(&key) {
+                self.cold_size -= entry.len;
+            }
+        }
+    }
 }
 
 pub struct SsdExpertCache {
@@ -353,17 +379,14 @@ impl SsdExpertCache {
             return None;
         }
 
-        let path = self.expert_path(layer_id, expert_id);
-        match std::fs::read(path) {
-            Ok(data) => {
-                self.stats.record_hit();
-                Some(data)
-            }
-            Err(_) => {
-                self.stats.record_miss();
-                None
-            }
+        if let Some(mmap) = self.mmap_prefetch(layer_id, expert_id) {
+            self.stats.record_hit();
+            return Some(mmap.to_vec());
         }
+
+        self.index.remove(&key);
+        self.stats.record_miss();
+        None
     }
 
     pub fn put(&self, layer_id: usize, expert_id: usize, data: &[u8]) -> Result<()> {
@@ -462,7 +485,7 @@ impl ThreeLevelCache {
         }
     }
 
-    pub fn get_expert(&mut self, layer_id: usize, expert_id: usize) -> Option<ExpertWeights> {
+    pub fn get_expert(&mut self, layer_id: usize, expert_id: usize) -> Option<Arc<ExpertWeights>> {
         if let Some(weights) = self.gpu.get(layer_id, expert_id) {
             return Some(weights);
         }

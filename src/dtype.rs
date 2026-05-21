@@ -28,14 +28,14 @@ impl DType {
 
     pub fn dlpack_type_code(&self) -> (u8, u8, u16) {
         match self {
-            DType::BF16 => (2, 16, 1),
+            DType::BF16 => (4, 16, 1),
             DType::FP32 => (2, 32, 1),
-            DType::FP8E4M3 => (2, 8, 1),
-            DType::FP4E2M1 => (1, 8, 1),
-            DType::FP8E8M0 => (3, 8, 1),
-            DType::INT32 => (1, 32, 1),
-            DType::INT64 => (1, 64, 1),
-            DType::UINT8 => (3, 8, 1),
+            DType::FP8E4M3 => (10, 8, 1),
+            DType::FP4E2M1 => (17, 4, 2),
+            DType::FP8E8M0 => (14, 8, 1),
+            DType::INT32 => (0, 32, 1),
+            DType::INT64 => (0, 64, 1),
+            DType::UINT8 => (1, 8, 1),
         }
     }
 

@@ -309,7 +309,7 @@ impl Gate {
 
                 let mut idx: Vec<usize> = (0..n).collect();
                 idx.sort_by(|&a, &b| {
-                    scores_with_bias[b].partial_cmp(&scores_with_bias[a]).unwrap_or(std::cmp::Ordering::Equal)
+                    scores_with_bias[b].total_cmp(&scores_with_bias[a])
                 });
 
                 for k in 0..self.topk {

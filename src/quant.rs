@@ -128,12 +128,22 @@ fn get_e8m0_scale(scales: &[u8], row: usize, group: usize, n_groups_per_row: usi
     e8m0_to_f32(scales[idx])
 }
 
-fn e8m0_to_f32(bits: u8) -> f32 {
+pub fn e8m0_to_f32(bits: u8) -> f32 {
     if bits == 0 {
         return 0.0;
     }
     let exponent = (bits as u32) << 23;
     f32::from_bits(exponent)
+}
+
+pub fn e8m0_to_f32_scale(data: &[u8], shape: &[usize]) -> Result<Vec<u8>, anyhow::Error> {
+    let n: usize = shape.iter().product();
+    let mut out = vec![0.0f32; n];
+    let src: &[u8] = bytemuck::cast_slice(data);
+    for i in 0..n {
+        out[i] = e8m0_to_f32(src[i]);
+    }
+    Ok(bytemuck::cast_slice(&out).to_vec())
 }
 
 pub fn fp8_e4m3_to_f32(bits: u8) -> f32 {
@@ -164,10 +174,10 @@ pub fn fp4_e2m1_to_f32(bits: u8) -> f32 {
     let val = if exp == 0 && mant == 0 {
         0.0f32
     } else if exp == 0 {
-        let m = mant as f32 / 2.0;
+        let m = mant as f32 * 0.5;
         m * 2.0f32.powi(1 - bias)
     } else {
-        let m = 1.0 + mant as f32 / 2.0;
+        let m = 1.0 + mant as f32 * 0.5;
         m * 2.0f32.powi(exp - bias)
     };
 

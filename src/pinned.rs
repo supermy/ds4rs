@@ -67,27 +67,16 @@ unsafe impl Send for PinnedBuffer {}
 unsafe impl Sync for PinnedBuffer {}
 
 pub struct PinnedPool {
-    buffer: Option<PinnedBuffer>,
     default_size: usize,
 }
 
 impl PinnedPool {
     pub fn new(default_size: usize) -> Self {
-        Self {
-            buffer: None,
-            default_size,
-        }
+        Self { default_size }
     }
 
-    pub fn get(&mut self, min_size: usize) -> Result<&mut PinnedBuffer> {
+    pub fn get(&mut self, min_size: usize) -> Result<PinnedBuffer> {
         let size = min_size.max(self.default_size);
-        let need_realloc = match &self.buffer {
-            Some(b) => b.len() < size,
-            None => true,
-        };
-        if need_realloc {
-            self.buffer = Some(PinnedBuffer::alloc(size)?);
-        }
-        Ok(self.buffer.as_mut().unwrap())
+        PinnedBuffer::alloc(size)
     }
 }

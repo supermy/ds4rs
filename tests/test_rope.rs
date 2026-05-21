@@ -45,7 +45,7 @@ fn test_rope_slice() {
     assert_eq!(cos.len(), 4 * config.qk_rope_head_dim / 2);
     assert_eq!(sin.len(), 4 * config.qk_rope_head_dim / 2);
 
-    let (cos2, sin2) = cache.get_slice(100, 4);
+    let (cos2, _sin2) = cache.get_slice(100, 4);
     assert_eq!(cos2.len(), cos.len());
     assert!(cos2 != cos, "different positions should have different freqs");
 }
