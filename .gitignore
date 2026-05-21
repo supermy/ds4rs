@@ -1,3 +1,5 @@
+ai-debug
+converted_ckpt
 /target
 *.so
 *.o

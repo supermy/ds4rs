@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.0] - 2025-05-21
+
+### IQ2_XS 量化支持
+
+#### 新增功能
+
+- **`--quant-type` 参数**: 支持 `fp4`（默认）和 `iq2xs` 两种量化类型，启动时自动选择推理路径
+- **IQ2_XS 预量化流水线**: 首次使用 `--quant-type iq2xs` 时，自动将 FP4 权重解码为 float32 后量化为 IQ2_XS 格式并保存为 `.iq2xs` 归档文件
+- **GPU 加速量化**: `quantize_iq2xs_gpu_optimized.py` 使用 CUDA kernel 并行执行 IQ2_XS 量化，大幅缩短预量化时间
+- **IQ2_XS GEMM 融合算子**: `iq2xs_gemm_tilelang.py` 将反量化与矩阵乘法融合为单个 TileLang persistent kernel，避免中间结果回写显存
+- **IQ2_XS 归档格式**: `iq2xs_archive.py` 实现自定义二进制归档格式，支持 mmap 零拷贝加载和按专家索引随机访问
+- **C/FFI 层**: `csrc/iq2_xs.h` 从 llama.cpp 抽取 IQ2_XS 完整量化/反量化实现，`csrc/iq2_xs_bridge.c` 提供 Rust FFI 桥接
+- **硬件检测**: 启动时检测 GPU 显存和系统内存，推荐合适的量化类型
+
+#### 缓存策略优化
+
+- **SLRU 缓存策略**: 替代 LFU，将缓存分为 protected 段和 probation 段，对访问模式变化更敏感
+- **IQ2_XS 缓存策略**: GPU 采用 SLRU，CPU 全量加载所有专家（~80GB），SSD 使用 mmap + OS 页缓存
+- **FP4 缓存策略保持**: GPU 采用 LFU，CPU 禁用，SSD 直接 I/O
+- **缓存容量动态计算**: 根据量化类型自动计算缓存容量，不硬编码
+
+#### 路由预测预取
+
+- **RoutePredictor**: 基于历史路由结果统计层间专家共现频率，预测下一层将激活的专家
+- **异步预取流水线**: GPU 计算 L 层 → CPU 预取 L+2 层专家到 GPU → SSD 预取 L+5 层专家到 CPU
+- **预取异常处理**: 预取失败不影响主推理流程
+
+#### Bug 修复
+
+- **查找表 GPU 缓存**: `iq2xs_gemm_tilelang.py` 中 `iq2xs_grid`、`ksigns_iq2xs` 查找表张量缓存到 GPU 常驻显存，避免每次调用重复传输
+- **bias 检查修复**: `model.py` 中 bias 检查改为 `if bias is not None`，避免零张量误判
+- **输入连续性检查**: IQ2_XS GEMM 调用前确保输入张量连续，避免断言错误
+- **Python/C 算法对齐**: 修复符号翻转逻辑，使 Python 量化 MSE 与 C 版本一致
+
+#### 新增文件
+
+- `inference/iq2xs_gemm_tilelang.py` - TileLang IQ2_XS 融合 GEMM 算子
+- `inference/iq2xs_archive.py` - IQ2_XS 归档格式读写与 mmap 加载
+- `inference/prequant_iq2xs.py` - FP4→IQ2_XS 预量化流水线
+- `inference/quantize_iq2xs_gpu_optimized.py` - GPU 加速 IQ2_XS 量化
+- `inference/iq2xs_c_wrapper.py` - Python ctypes 调用 C 量化实现
+- `inference/iq2xs_gemm.py` - 纯 PyTorch IQ2_XS GEMM 参考实现
+- `csrc/iq2_xs.h` - IQ2_XS 量化/反量化 C 实现
+- `csrc/iq2_xs_bridge.c` - Rust FFI 桥接层
+- `csrc/iq2_xs.cu` / `csrc/iq2_xs.cuh` - IQ2_XS CUDA GPU 实现
+
+#### 修改文件
+
+- `inference/generate.py` - 新增 `--quant-type` 参数、IQ2_XS 预量化检测、硬件检测
+- `inference/expert_cache.py` - 新增 IQ2_XS 缓存策略、SLRU 实现、RoutePredictor 路由预测预取
+- `inference/model.py` - 新增 IQ2_XS GEMM 集成分支、量化类型路由
+
 ## [0.8.0] - 2025-05-18
 
 ### 🔴 关键内存泄漏修复
