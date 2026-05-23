@@ -1028,6 +1028,12 @@ class MoE(nn.Module):
                 )
         return self.experts[idx]
 
+    def _get_compute_streams(self, n: int):
+        """获取 CUDA Stream 池（复用，避免每次调用重新创建）。"""
+        if not hasattr(self, '_compute_streams'):
+            self._compute_streams = [torch.cuda.Stream() for _ in range(6)]  # top-k=6
+        return self._compute_streams[:n]
+
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """MoE 前向传播。
 
@@ -1060,12 +1066,21 @@ class MoE(nn.Module):
         if self._on_experts_needed is not None:
             self._on_experts_needed(activated)
 
+        # 在默认流上预计算专家分配，避免并行流对 indices 的竞争
+        expert_inputs = {}
+        expert_weights = {}
         for i in activated:
             expert = self.experts[i]
             if expert is None:
                 continue
             idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
+            expert_inputs[i] = (x[idx], idx, top)
+
+        # 逐专家计算（串行，避免多 Stream 并行导致 OOM）
+        for i in expert_inputs:
+            expert = self.experts[i]
+            xi, idx, top = expert_inputs[i]
+            y[idx] += expert(xi, weights[idx, top, None])
 
         # 流式卸载回调：专家计算完毕后释放 GPU 显存
         if self._on_experts_done is not None:

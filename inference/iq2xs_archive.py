@@ -1,10 +1,10 @@
 """统一专家量化文件格式 — 支持所有专家打包到单个文件，mmap 读取。
 
-文件格式设计：
+文件格式设计 (v2 分离存储):
 ================================================================================
 文件头 (固定 64 字节):
   magic:           4B  "IQ2X"
-  version:         4B  uint32 (当前版本 1)
+  version:         4B  uint32 (当前版本 2)
   n_layers:        4B  uint32
   n_experts:       4B  uint32 (每层专家数)
   n_weights:       4B  uint32 (每专家权重数，通常 3 = w1/w2/w3)
@@ -22,16 +22,21 @@
   in_dim:          4B  uint32
   offset:          8B  uint64 (数据在文件中的偏移)
 
-数据区 (每个专家权重):
-  d:               n_blocks * 2B  float16 (全局缩放因子)
-  qs:              n_blocks * 32 * 2B  uint16 (grid 索引 + 符号索引)
-  scales:          n_blocks * 8B  uint8 (4-bit 打包的子块缩放)
+数据区 (每个专家权重, v2 分离存储):
+  d:               n_blocks * 2B  float16 (全局缩放因子, 连续存储)
+  qs:              n_blocks * 32 * 2B  uint16 (grid 索引 + 符号索引, 连续存储)
+  scales:          n_blocks * 8B  uint8 (4-bit 打包的子块缩放, 连续存储)
+  总大小:          n_blocks * 74B (与 v1 交织存储相同)
+
+v1 交织存储 (兼容):
+  每个 block: d(2B) + qs(64B) + scales(8B) = 74B
 ================================================================================
 
 优势：
 - 单文件便于管理和传输
 - mmap 读取，OS 自动管理页面缓存
 - 索引表支持 O(1) 查找任意专家
+- v2 分离存储: 读取时零拷贝，无需 .copy() 消除列切片非连续问题
 - 顺序存储优化预读性能
 """
 import os
@@ -42,7 +47,7 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
 MAGIC = b"IQ2X"
-VERSION = 1
+VERSION = 2  # v2: 分离存储 d/qs/scales（消除读取时的 .copy()）
 HEADER_SIZE = 64
 INDEX_ENTRY_SIZE = 32
 
@@ -106,19 +111,13 @@ class IQ2XSArchiveWriter:
         """
         n_blocks = d.shape[0]
 
-        # 打包数据: 逐 block 交织存储 (与 GGUF/llama.cpp block_iq2_xs 一致)
-        # 每个 block: d(2B) + qs(64B) + scales(8B) = 74B
-        BLOCK_BYTES = 74
-        d_flat = d.astype(np.float16).ravel()
-        qs_flat = qs.astype(np.uint16).reshape(n_blocks, 32)
-        scales_flat = scales.astype(np.uint8).reshape(n_blocks, 8)
-
-        # 向量化交织: 避免逐 block Python 循环
-        block_arr = np.zeros((n_blocks, BLOCK_BYTES), dtype=np.uint8)
-        block_arr[:, 0:2] = d_flat.view(np.uint8).reshape(n_blocks, 2)
-        block_arr[:, 2:66] = qs_flat.view(np.uint8).reshape(n_blocks, 64)
-        block_arr[:, 66:74] = scales_flat.reshape(n_blocks, 8)
-        data = block_arr.tobytes()
+        # v2 分离存储: d + qs + scales 各自连续存储
+        # 优势: 读取时 np.frombuffer 可直接创建连续视图，无需 .copy()
+        # 总大小与 v1 交织存储相同: n_blocks * (2 + 64 + 8) = n_blocks * 74B
+        d_data = d.astype(np.float16).ravel().tobytes()
+        qs_data = qs.astype(np.uint16).reshape(n_blocks, 32).tobytes()
+        scales_data = scales.astype(np.uint8).reshape(n_blocks, 8).tobytes()
+        data = d_data + qs_data + scales_data
         
         # 添加索引
         self.index.append(ExpertIndex(
@@ -183,7 +182,8 @@ class IQ2XSArchiveReader:
         self._file = None
         self._mmap = None
         self._index: Dict[Tuple[int, int, int], ExpertIndex] = {}
-        
+        self._version = VERSION  # 归档版本
+
         self._open()
     
     def _open(self):
@@ -197,8 +197,9 @@ class IQ2XSArchiveReader:
             raise ValueError(f"无效的 IQ2XS 归档文件: magic={magic}")
         
         version, = struct.unpack('<I', header[4:8])
-        if version != VERSION:
+        if version not in (1, 2):
             raise ValueError(f"不支持的版本: {version}")
+        self._version = version
         
         self.n_layers, = struct.unpack('<I', header[8:12])
         self.n_experts, = struct.unpack('<I', header[12:16])
@@ -266,18 +267,33 @@ class IQ2XSArchiveReader:
         if entry is None:
             return None
         
-        # 从 mmap 读取数据 (逐 block 交织存储: d(2)+qs(64)+scales(8)=74B)
+        # 从 mmap 读取数据
         offset = entry.offset
         n_blocks = entry.n_blocks
-        BLOCK_BYTES = 74
 
-        raw = self._mmap[offset:offset + n_blocks * BLOCK_BYTES]
-
-        # 向量化解析: 避免逐 block Python 循环
-        raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, BLOCK_BYTES)
-        d = raw_arr[:, 0:2].copy().view(np.float16).reshape(n_blocks)
-        qs = raw_arr[:, 2:66].copy().view(np.uint16).reshape(n_blocks, 32)
-        scales = raw_arr[:, 66:74].copy()
+        if self._version == 2:
+            # v2 分离存储: d + qs + scales 各自连续
+            # np.frombuffer(mmap, offset=...) 零拷贝，直接映射 mmap 页面
+            d = np.frombuffer(self._mmap, dtype=np.float16,
+                              count=n_blocks, offset=offset)
+            d_bytes = n_blocks * 2
+            qs = np.frombuffer(self._mmap, dtype=np.uint16,
+                               count=n_blocks * 32,
+                               offset=offset + d_bytes).reshape(n_blocks, 32)
+            qs_bytes = n_blocks * 64
+            scales = np.frombuffer(self._mmap, dtype=np.uint8,
+                                   count=n_blocks * 8,
+                                   offset=offset + d_bytes + qs_bytes).reshape(n_blocks, 8)
+        else:
+            # v1 交织存储: d(2)+qs(64)+scales(8)=74B per block
+            # 列切片不连续，必须 .copy() 才能 .view() 为目标 dtype
+            BLOCK_BYTES = 74
+            raw_arr = np.frombuffer(self._mmap, dtype=np.uint8,
+                                    count=n_blocks * BLOCK_BYTES,
+                                    offset=offset).reshape(n_blocks, BLOCK_BYTES)
+            d = raw_arr[:, 0:2].copy().view(np.float16).reshape(n_blocks)
+            qs = raw_arr[:, 2:66].copy().view(np.uint16).reshape(n_blocks, 32)
+            scales = raw_arr[:, 66:74].copy()
 
         # reshape 为 IQ2_XS GEMM kernel 期望的形状
         # kernel 期望: d[N, n_blocks_per_row], qs[N, n_blocks_per_row, 32], scales[N, n_blocks_per_row, 8]

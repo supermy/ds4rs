@@ -271,12 +271,20 @@ def prequant_iq2xs(
         buf = [BatchBuffer(), BatchBuffer()]
 
         def load_batch_cpu(tensor_cache, expert_list):
-            """CPU 端: 从缓存中获取并拼接 FP4 数据"""
+            """CPU 端: 从缓存中获取并拼接 FP4 数据和 scale"""
             packed_parts = [tensor_cache[name] for _, _, _, name in expert_list]
-            return torch.stack(packed_parts, dim=0)
+            # 同时加载对应的 scale 张量
+            scale_parts = []
+            for _, _, wn, name in expert_list:
+                scale_name = name.replace('.weight', '.scale')
+                if scale_name in tensor_cache:
+                    scale_parts.append(tensor_cache[scale_name])
+                else:
+                    scale_parts.append(None)
+            return torch.stack(packed_parts, dim=0), scale_parts
 
-        def prepare_batch(buf_idx, packed_cpu, expert_list, shape_key):
-            """GPU 端: 上传 + 解码 + 分配输出"""
+        def prepare_batch(buf_idx, packed_cpu, scale_parts, expert_list, shape_key):
+            """GPU 端: 上传 + 解码 + 应用 scale + 分配输出"""
             b = buf[buf_idx]
             b.clear()
 
@@ -285,7 +293,7 @@ def prequant_iq2xs(
             blocks_per_expert = out_dim * in_dim // QK_K
             n = len(expert_list)
 
-            # GPU 端: 上传 + 解码 (在传输 stream 上异步执行)
+            # GPU 端: 上传 + 解码 + 应用 scale (在传输 stream 上异步执行)
             with torch.cuda.stream(stream_xfer):
                 packed_gpu = packed_cpu.cuda(non_blocking=True)
                 del packed_cpu
@@ -297,8 +305,18 @@ def prequant_iq2xs(
                 table = FP4_TABLE_F32.to(arr.device)
                 lo_val = table[lo]
                 hi_val = table[hi]
-                decoded = torch.stack([lo_val, hi_val], dim=-1).reshape(n * out_dim, in_dim).contiguous()
+                decoded = torch.stack([lo_val, hi_val], dim=-1).reshape(n * out_dim, in_dim).contiguous().float()
                 del packed_gpu, lo, hi, lo_val, hi_val
+
+                # 应用 FP4 scale (float8_e8m0fnu)
+                # scale shape: [out_dim, in_dim/32], 每 32 个元素共享一个 scale
+                if scale_parts[0] is not None:
+                    scale_scales = torch.stack(scale_parts, dim=0)  # [n, out_dim, in_dim/32]
+                    scale_gpu = scale_scales.cuda(non_blocking=True).view(torch.float8_e8m0fnu).float()
+                    # repeat_interleave 使 scale 与 decoded 对齐
+                    scale_expanded = scale_gpu.reshape(n * out_dim, -1).repeat_interleave(32, dim=1)
+                    decoded = decoded * scale_expanded
+                    del scale_scales, scale_gpu, scale_expanded
 
                 b.f32_gpu = decoded
 
@@ -363,6 +381,10 @@ def prequant_iq2xs(
                 tensor_cache = {}
                 for layer_id, expert_id, weight_name, tensor_name, shape in shard_experts:
                     tensor_cache[tensor_name] = sf.get_tensor(tensor_name)
+                    # 同时加载对应的 scale 张量
+                    scale_name = tensor_name.replace('.weight', '.scale')
+                    if scale_name not in tensor_cache and scale_name in sf.keys():
+                        tensor_cache[scale_name] = sf.get_tensor(scale_name)
                 preload_ms = (time.time() - t_preload) * 1000
                 print(f"  预加载 {len(tensor_cache)} 个张量: {preload_ms:.0f}ms")
 
@@ -385,8 +407,8 @@ def prequant_iq2xs(
                 # 预加载第一个 batch
                 shape_key, batch = all_batches[0]
                 t_prep = time.time()
-                packed_cpu = load_batch_cpu(tensor_cache, batch)
-                prepare_batch(0, packed_cpu, batch, shape_key)
+                packed_cpu, scale_parts = load_batch_cpu(tensor_cache, batch)
+                prepare_batch(0, packed_cpu, scale_parts, batch, shape_key)
                 del packed_cpu
                 t_launch = time.time()
                 launch_quantize(0)
@@ -404,12 +426,12 @@ def prequant_iq2xs(
                     # 1. 等待后台 CPU 加载完成, 上传到 GPU
                     t_wait = time.time()
                     if next_cpu_future is not None:
-                        packed_cpu = next_cpu_future.result()
+                        packed_cpu, scale_parts = next_cpu_future.result()
                     else:
-                        packed_cpu = load_batch_cpu(tensor_cache, batch)
+                        packed_cpu, scale_parts = load_batch_cpu(tensor_cache, batch)
 
                     t_upload = time.time()
-                    prepare_batch(buf_idx, packed_cpu, batch, shape_key)
+                    prepare_batch(buf_idx, packed_cpu, scale_parts, batch, shape_key)
                     del packed_cpu
 
                     # 2. 消费上一个 batch (等 GPU 完成 + 解析 + 写归档)
@@ -472,6 +494,16 @@ def prequant_iq2xs(
 
                     raw = tensor.numpy().tobytes()
                     f32 = decode_fp4_cpu(raw)
+
+                    # 应用 FP4 scale (float8_e8m0fnu)
+                    scale_name = tensor_name.replace('.weight', '.scale')
+                    if scale_name in sf.keys():
+                        scale_tensor = sf.get_tensor(scale_name)
+                        scale_f32 = scale_tensor.view(torch.float8_e8m0fnu).float().numpy()
+                        # scale shape: [out_dim, in_dim/32], 每 32 个元素共享一个 scale
+                        scale_expanded = np.repeat(scale_f32, 32, axis=1).reshape(-1)
+                        f32 = f32 * scale_expanded[:f32.size]
+
                     n_elements = f32.size
                     n_blocks = (n_elements + QK_K - 1) // QK_K
                     if n_elements % QK_K != 0:

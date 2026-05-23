@@ -20,3 +20,13 @@ __pycache__/
 *.pyc
 tilelang/build/
 misc/
+# IQ2_XS 归档文件（~80GB）
+iq2xs/
+# 编译产物
+inference/verify_archive_iq2xs
+inference/verify_gguf_iq2xs
+# 临时文档
+translate_*.py
+DeepSeek_V4_raw.txt
+# .trae 本地配置
+.trae/

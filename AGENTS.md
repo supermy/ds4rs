@@ -2,13 +2,78 @@
 
 `ds4.rs` 是 DeepSeek V4 Flash 的专用单机推理引擎，基于 96G DDR5 + RTX5060Ti16G 定制开发。目标是构建一个小巧、可读、高性能的 Rust 代码库，复刻 inference 目录下官方推理，inference 目录下官方 TileLang（Python）将算子编译成共享库（.so），然后在 Rust 加载执行。内核存放在 `tilelang/` 目录下。
 
+python3 -c "
+from safetensors import safe_open
+with safe_open('/models/model-00002-of-00046.safetensors', 'pt') as f:
+    keys = f.keys()
+    print(f'Keys in 00001: {len(keys)}')
+    print([k for k in keys if 'expert' in k.lower()][:10])
+"
+
+## 新目标
+    
+    建立一个新的rust推理程序,moe fp4推理性能最优：gpu利用率100%
+    资源：内存90G 显存16G  AMD Ryzen 5 7600 6-Core 12线程
+    参考：python fp4推理全流程；docs/cuda_quantize.md;
+    技术：rust cuda  slru
+    场景：单机应用
+    
 ## 目标
 
-    FP4 专家：150GB
-    IQ2_XS 专家：80GB
     内存：90GB
     显存：16GB
     系统两种量化都支持
+    FP4 专家：150GB
+    IQ2_XS 专家：80GB
+
+### 全GPU推理
+
+    全GPU双缓冲流水线推理，基于CUDA Event；
+    路由专家缓存CPU100%，SSD命中率0%;
+    GPU预取命中率：16GB卡~78%（受VRAM限制），24GB卡可达100%;
+
+### GPU+CPU推理
+    
+    GPU 富余算力 + CPU 兜底
+
+    GPU非路由专家推理；
+    GPU热门路由专家推理；专家访问的幂律分布；
+    CPU路由专家推理；
+    RUST实现：抽取ds4/llama.cpp 中的路由专家推理代码；对比优化前后的性能；
+    CPU 内存布局（NHWC/Tile 格式） 和 AVX-512 指令级优化；
+    L3 32Mb: IQ2;专家权重共享：TurboQuant / LUT 235MB->15MB;
+    路由逻辑的 SIMD 优化  路由延迟目标：< 1μs（完全在 L1 内完成）
+- L3 常驻专家池
+
+时间轴 →
+─────────────────────────────────────────────────────────────►
+
+Token N:
+  GPU:  [Attention][──────────等待──────────][Attention+1]
+  CPU:  [路由TopK][FFN Ea][FFN Eb][聚合][──────空闲──────]
+         ↑ 预取 Ea,Eb 权重到 L3
+
+Token N+1:
+  GPU:  [Attention][──────────等待──────────][Attention+1]
+  CPU:  [路由TopK][FFN Ec][FFN Ed][聚合][──────空闲──────]
+         ↑ 预取 Ec,Ed (与 GPU attention 重叠)
+
+#### 分层架构；
+
+GPU 16GB 常驻：
+├─ Attention + Shared Expert + Norm    (~8GB)
+├─ KV Cache                            (~2-4GB)
+├─ 热门专家池 (Top-4, FP16)            (~4-8GB)  ← 富余算力利用
+│   • E0, E1, E2, E3 常驻显存
+│   • 命中率 ~50-60%
+└─ 应急缓冲                            (~1-2GB)
+
+CPU 96GB：
+├─ 全部 64 专家 IQ2XS                  (80GB)
+├─ 冷专家解压缓冲区                     (8GB)
+└─ 系统 + 框架                          (8GB)
+             
+
 ### 推理流程
 
     ┌─────────────────────────────────────────────────────────────┐
@@ -40,8 +105,10 @@
 ### 专家缓存
 
 - GPU/CPU M 层 N 专家编号 + LFU 频率到磁盘，支持热启动
-- 多级异步预取流水线：GPU 计算 L 层 → CPU 预取 L+2→GPU → SSD 预取 L+5→CPU
+- 多级异步预取流水线：GPU 计算 L 层 → CPU 预取 L+1 层差集 → GPU DMA
 - 专家在 FP4 scale 支持 Delta 分解 + ZipNN 熵编码压缩；只缓存 fp4 weight，scale 从 RAM 读取
+- IQ2_XS 模式：GPU SLRU（90% protected / 10% probation + step 保护），CPU 全量 pinned pool（100% 命中）
+- 缓存策略实测：SLRU > W-TinyLFU（MoE 访问模式稳定，准入策略无意义）
 
 ### 量化配置
 - 量化类型：默认 FP4，支持 IQ2_XS（启动参数 `--quant-type=[fp4|iq2xs]`）；如果配置iq2xs,检测本地是否有 IQ2_XS 文件，否则使用预量化保存到本地；
@@ -56,14 +123,66 @@
     - SSD5 硬盘：全量路由专家
 - TODO: CPU/GPU: 模型分层滑窗 + 热点；SLRU/FIFO
 
+#### imatrix量化 TODO
+
+    # 1. 准备校准数据集
+    python3 gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py
+
+    # 2. 收集激活统计
+    python 推理  -m gguf experts.gguf \
+    --imatrix-dataset gguf-tools/imatrix/dataset/rendered_prompts.txt \
+    --imatrix-out gguf/imatrix-routed-moe-ds4.dat \
+    --ctx 32768
+
+    # 3. 使用生成的 .dat 文件重新量化
+
+
 #### IQ2_XS缓存策略
 - 非路由专家常驻 GPU
 - 路由专家三级缓存（GPU/CPU/SSD）：
-    - GPU 显存：采用 SLRU
-    - CPU 内存：全量专家全部加载
-    - SSD5 硬盘：全量专家mmap 加载，OS 页缓存管理 
-
+    - GPU 显存：采用 SLRU（90% protected / 10% probation）
+        - Step 级别专家保护：当前 step 已访问专家不被淘汰（容量 ≥ 2× 工作集时启用）
+        - 层保护：当前层专家不被淘汰
+        - W-TinyLFU 实测不如 SLRU（MoE 访问模式稳定，准入策略无意义），代码保留可切换
+    - CPU 内存：全量专家 pinned pool 加载（~74GB），CPU 命中率 100%
+    - SSD5 硬盘：全量专家 mmap 加载，OS 页缓存管理
+- GPU 命中率：16GB 卡 ~78%（受 VRAM 限制），24GB 卡可达 100%
 - 专家IQ2_XS 量化/反量化路径：解码 FP4 →TileLang(float32 → IQ2_XS 量化 )→ 缓存 → 传 GPU → TileLang IQ2_XS GEMM kernel
+
+#### 时间线
+
+延迟隐藏效果 ：
+
+- 预取延迟 ~1.5ms 完全隐藏在共享专家+缓存命中专家的计算时间内
+- 理想情况下，SSD→GPU 延迟对推理不可见
+
+                        ┌─── L 层 ───┐┌─── L+1 层 ───┐
+    Gate                ████         ████
+    预取 L 层差集       ████████     
+    共享专家+缓存命中       ██████████
+    预取 L+1 层差集             ████████
+    L 层剩余专家                   ██████████
+    L+1 层缓存命中                           ██████████
+    L+1 层剩余专家                               ██████████
+
+    GPU选中预取选中可释放资源后，cuda event 1 触发预取 L+1 层差集，cuda event 2 触发预取 L+2 层差集；
+
+    sequenceDiagram
+        participant Gate as MoE Gate
+        participant Cache as ExpertCache
+        participant Pool as Pinned Pool
+        participant GPU as GPU
+        Gate->>Cache: activated_indices
+        Cache->>Cache: 识别差集 (不在GPU/不在预取中)
+        Cache->>Cache: prefetch_experts_batch (Phase 2)
+        par 并行预取
+            Cache->>Pool: 查询 pinned pool
+            Pool-->>GPU: DMA (无 page fault)
+        and 回退路径
+            Cache->>Cache: mmap 读取 + pin_memory
+            Cache->>GPU: DMA
+        end
+        Cache->>GPU: 并行 GEMM (Phase 3, CUDA Streams)
 
 
 ### 其他

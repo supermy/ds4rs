@@ -395,6 +395,12 @@ def load_weights_streaming(model: Transformer, ckpt_path: str, rank: int, world_
     vram_mb = torch.cuda.memory_allocated() / (1024**2)
     print(f"[Streaming] GPU VRAM: {vram_mb:.0f}MB")
 
+    # 记录初始 VRAM 空闲量（模型加载后、专家缓存加载前）
+    # 使用 mem_get_info() 获取实际可用 VRAM（含 CUDA context 等非 PyTorch 分配）
+    vram_free_mb, vram_total_mb = torch.cuda.mem_get_info()
+    vram_free_mb = vram_free_mb / (1024**2)
+    expert_cache._initial_vram_free_mb = vram_free_mb
+
     # 步骤 4：更新 expert_cache 的 expert_key_map（步骤 1 中已创建）
     expert_cache.expert_key_map = expert_key_map
     expert_cache.setup(model, len(model.layers),
@@ -417,18 +423,50 @@ def load_weights_streaming(model: Transformer, ckpt_path: str, rank: int, world_
 
     expert_cache.preload_experts_to_ram()
 
-    print(f"[Streaming] Cache v8: L1 GPU (SLRU cap={expert_cache._gpu_cache.capacity}) → L2 CPU (SLRU cap={expert_cache._cpu_cache.capacity}) → L2.5 RAM (FP8 scale ZipNN) → L3 SSD")
+    print(f"[Streaming] Cache v9: L1 GPU (SLRU prot={expert_cache._gpu_cache.protected_capacity}/prob={expert_cache._gpu_cache.probation_capacity} cap={expert_cache._gpu_cache.capacity}) → L2 CPU (SLRU cap={expert_cache._cpu_cache.capacity}) → L2.5 RAM (FP8 scale ZipNN) → L3 SSD")
 
 
 def _load_activated_experts(moe, activated_indices: list) -> None:
     """使用 SLRU 缓存加载激活专家的权重到 GPU。
 
-    缓存查找顺序：L1 GPU SLRU → DMA 预取 → L2 CPU SLRU → L3 SSD
+    优化策略（100% pinned pool 模式）：
+    1. Gate 计算后立即并行 DMA 所有差集专家（从 pinned pool → GPU）
+    2. DMA 与 Expert 空壳创建重叠
+    3. 当前层加载完成后，立即预取 L+1 层差集
+
+    缓存查找顺序：L1 GPU SLRU → DMA 预取 → Pinned Pool → SSD
     """
     cache = moe._expert_cache
     layer_id = moe.layer_id
     cache.on_layer_start(layer_id)
 
+    # === 阶段 1：识别差集并并行预取 ===
+    # 差集 = 不在 GPU 缓存且不在预取队列中的专家
+    diff_keys = []
+    gpu_hit_ids = []
+
+    for expert_id in activated_indices:
+        key = (layer_id, expert_id)
+        if cache._gpu_cache.contains(key):
+            gpu_hit_ids.append(expert_id)
+        else:
+            with cache._prefetch_lock:
+                in_prefetch = (layer_id in cache._prefetch_pending and
+                               expert_id in cache._prefetch_pending[layer_id])
+                in_iq2xs_prefetch = key in cache._iq2xs_prefetch_pending
+            if not in_prefetch and not in_iq2xs_prefetch:
+                diff_keys.append(key)
+
+    # 并行提交所有差集专家到预取线程池（非阻塞）
+    if diff_keys:
+        cache.prefetch_experts_batch(diff_keys)
+
+    # === 阶段 2：处理 GPU 缓存命中的专家 ===
+    for expert_id in gpu_hit_ids:
+        with torch.device('cpu'):
+            moe._ensure_expert(expert_id)
+
+    # === 阶段 3：处理差集专家（等待预取完成 + 设置参数） ===
     all_gpu_params = {}
     missed = []
 
@@ -463,6 +501,7 @@ def _load_activated_experts(moe, activated_indices: list) -> None:
     if layer_id <= 2 and not hasattr(moe, '_debug_printed'):
         moe._debug_printed = True
 
+    # === 阶段 4：预取下一层 ===
     cache.prefetch_next_layer(layer_id, activated_indices)
 
 
@@ -559,6 +598,11 @@ def generate(
     # - 对于长度大于 min(prompt_lens) 的序列，第一个 forward 会处理多个 prompt tokens（prefill）。
     # - 所有序列在 cur_pos 达到各自 prompt 长度后进入逐 token decode 阶段。
     for cur_pos in range(min(prompt_lens), total_len):
+        # Step 开始：重置 step 级别保护集合
+        cache = getattr(model, '_expert_cache', None)
+        if cache is not None:
+            cache.on_step_start(cur_pos)
+
         t0 = __import__('time').time()
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         fwd_ms = (__import__('time').time() - t0) * 1000
@@ -574,11 +618,19 @@ def generate(
         prev_pos = cur_pos
 
         # 推理进度日志：每步打印 forward 耗时和缓存统计
-        cache = getattr(model, '_expert_cache', None)
+        # 在 on_step_end 之前打印，这样 step_prot 才能显示当前 step 的保护数
         if cache is not None and cur_pos % 5 == 0:
             s = cache._stats
-            print(f"[Step {cur_pos}] fwd={fwd_ms:.0f}ms gpu={s['gpu_hits']} cpu={s['cpu_hits']} "
-                  f"ssd={s['ssd_hits']} pf_hit={s['prefetch_hits']}", flush=True)
+            total = s['gpu_hits'] + s['cpu_hits'] + s['ssd_hits'] + s['pinned_pool_hits']
+            gpu_rate = s['gpu_hits'] / total * 100 if total > 0 else 0
+            print(f"[Step {cur_pos}] fwd={fwd_ms:.0f}ms gpu={s['gpu_hits']}({gpu_rate:.0f}%) "
+                  f"pinned={s['pinned_pool_hits']} cpu={s['cpu_hits']} ssd={s['ssd_hits']} "
+                  f"pf_hit={s['prefetch_hits']} evict={s['gpu_evictions']} "
+                  f"step_prot={len(cache._step_protected_keys) if cache._step_protected_keys is not None else -1}", flush=True)
+
+        # Step 结束：清理 step 级别保护
+        if cache is not None:
+            cache.on_step_end()
 
         # 每 10 个 token 检查内存压力并回收
         if cur_pos % 10 == 0:
@@ -792,6 +844,9 @@ def main(
         # IQ2_XS: 延迟打开归档（常驻权重已加载完，页缓存不再竞争）
         if iq2xs_dir:
             expert_cache._ensure_iq2xs_archive()
+            # 归档打开后重新调整 VRAM 容量（IQ2_XS 专家更小，需更多预留）
+            expert_cache._vram_adjusted = False
+            expert_cache.adjust_window_for_vram()
 
         cache_loaded = expert_cache.load_cache_state()
         total_freq = expert_cache.total_freq_entries()

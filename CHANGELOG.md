@@ -2,6 +2,99 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.4] - 2025-05-23
+
+### GPU 缓存策略深度优化
+
+#### W-TinyLFU vs SLRU 实测对比
+
+实现了 W-TinyLFU（Caffeine/Guava Cache 同款算法）并与 SLRU 做了实测对比：
+
+| 指标 | SLRU (v9) | W-TinyLFU (v9) |
+|---|---|---|
+| GPU 缓存容量 | 642 专家 | 585 专家 |
+| GPU 命中率 | **76-78%** | 71% |
+| 推理延迟 | ~200ms/step | ~210ms/step |
+
+**结论：SLRU 更适合 MoE 场景**，W-TinyLFU 不适合的 3 个原因：
+1. MoE 访问模式稳定（同一对话内路由高度稳定），不需要频率衰减适应变化
+2. 工作集 ≈ 缓存容量时，准入策略退化为"全准入"，Window 段浪费 5% 容量
+3. CMS 频率估计 + Window→Main 转移增加代码复杂度，无命中率提升
+
+#### SLRU 策略优化
+
+- **protected 比例 75% → 90%**: 减少热点专家被淘汰概率，probation 段仅占 10%
+- **Step 级别专家保护**: 当前 step 已访问的专家不被淘汰（缓存容量 ≥ 2× 工作集时自动启用）
+- **层保护增强**: `_evict_lru_skip_layer` 支持 `step_protected_keys` 参数，双重防淘汰
+- **VRAM 预留精简**: VRAM_RESERVE_MB 从 800→1200→800MB，平衡 OOM 风险和缓存容量
+
+#### Warmup 优化
+
+- **无频率数据时加载 top 30 专家/层**（原 12），更充分填满缓存
+- **put_force_protected 支持 step_protected_keys**: warmup 时也遵守 step 保护
+
+#### 100% GPU 命中率分析
+
+| GPU 显存 | 可容纳专家数 | 预期命中率 |
+|---|---|---|
+| 16GB (当前) | ~642 | ~78% |
+| 24GB | ~2048 | ~100% |
+| 80GB | ~10240 | ~100% |
+
+16GB 卡受 VRAM 限制，GPU 命中率上限 ~78%。要达到 100% 需要 24GB+ 显存或减少专家 GPU 占用。
+
+#### 新增类
+
+- **CountMinSketch**: O(1) 频率估计器，用于 W-TinyLFU 准入决策
+- **WTinyLFU**: Window(5%) + SLRU Main(95%) + CMS 准入策略，代码保留可切换
+
+#### 修改文件
+
+- `inference/expert_cache.py` - SLRU 90% protected、step 保护、W-TinyLFU 实现、VRAM 预留调整
+- `inference/generate.py` - on_step_start/end 调用、step_prot 统计、缓存策略描述更新
+
+## [0.9.3] - 2025-05-23
+
+### IQ2_XS 推理乱码修复
+
+#### 根本原因
+- **FP4 scale 未应用**: `prequant_iq2xs.py` 中 FP4→IQ2_XS 量化时，只做了 FP4 查表解码（值域 [-6, 6]），没有乘以 `float8_e8m0fnu` scale（约 0.004~0.031），导致 IQ2_XS 量化输入值域错误，反量化后权重值域偏大 ~100 倍，推理输出乱码
+
+#### 修复内容
+- **CUDA 路径**: `prepare_batch()` 加载 `.scale` 张量，GPU 上应用 `decoded * scale_expanded`
+- **CPU 路径**: `_quantize_expert_cpu()` 加载 `.scale` 张量，应用 `f32 * scale_expanded`
+- **预加载**: 同时加载 `.weight` 和 `.scale` 张量
+
+#### 验证结果
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| Layer 10 expert 0 d 值 | 0.0 (全零) | 0.000395 |
+| GEMM vs FP4 参考 mean_error | 118.0 | 0.38 |
+| 推理输出 | "dekameters" (乱码) | "The capital of France is Paris." |
+
+#### 修改文件
+- `inference/prequant_iq2xs.py` - FP4 解码后应用 scale
+
+### IQ2_XS 推理性能优化
+
+#### 归档格式 v2: 分离存储 d/qs/scales
+- **问题**: v1 交织存储格式（d[2B]+qs[64B]+scales[8B]=74B/block）导致读取时列切片非连续，必须 `.copy()` 才能 `.view()` 为目标 dtype，每个专家权重 3 次拷贝
+- **修复**: v2 格式将 d/qs/scales 各自连续存储，`np.frombuffer(mmap, offset=...)` 直接创建连续视图，零拷贝读取
+- **兼容**: 读取器同时支持 v1 和 v2 格式，写入器使用 v2 格式
+- **数据流**: mmap → `np.frombuffer`（零拷贝视图）→ `torch.from_numpy` → `pin_memory()`（拷贝到 pinned memory）→ `to("cuda", non_blocking=True)`（DMA 异步传输）
+- **效果**: 消除归档读取的 3 次 `.copy()`，数据从 mmap 直接到 pinned memory，减少一次内存拷贝
+
+#### IQ2_XS 归档预取移到后台线程
+- **问题**: `_async_prefetch_expert()` 中 IQ2_XS 归档读取在主线程同步执行，SSD I/O + page fault 阻塞推理
+- **修复**: 新增 `_iq2xs_prefetch_executor` 线程池，归档读取 + GPU 传输在后台线程执行，与主线程 GPU 计算重叠
+- **线程安全**: 新增 `_prefetch_lock` 保护 `_prefetch_pending` 的并发访问，`_promote_prefetch` 使用快照避免长时间持锁
+- **效果**: SSD I/O 延迟隐藏在 GPU 计算期间，减少推理时的同步等待
+
+#### 修改文件
+- `inference/iq2xs_archive.py` - 归档格式 v2（分离存储），读取器兼容 v1/v2
+- `inference/expert_cache.py` - 零拷贝读取 + pin_memory、后台线程预取、线程安全锁
+
 ## [0.9.2] - 2025-05-23
 
 ### IQ2_XS 数据存储优化与 C 验证
