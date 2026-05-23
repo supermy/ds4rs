@@ -298,6 +298,7 @@ class ExpertCache:
     """
 
     MEM_SAFE_LIMIT_GB = 20  # 预留系统+模型+推理buffer+scale
+    MEM_SAFE_LIMIT_GB_FP4 = 6  # FP4 模式：更激进的内存使用，预留更少
     MIN_EXPERTS_PER_LAYER = 12
 
     EXPERT_MB = 12.0  # 仅 weight (I8)，scale 从 RAM 读取
@@ -337,18 +338,16 @@ class ExpertCache:
         self._cpu_top_n = cpu_top_n
         self._iq2xs_dir = iq2xs_dir
 
-        # IQ2_XS 归档读取器（mmap）
+        # IQ2_XS 归档读取器（延迟打开，避免 mmap 77GB 与 safetensors 加载竞争页缓存）
         self._iq2xs_archive: Optional[IQ2XSArchiveReader] = None
+        self._iq2xs_archive_path: Optional[str] = None
 
-        # 检测归档文件
+        # 记录归档路径，但不立即打开（mmap 77GB 会与 safetensors 加载竞争页缓存）
         if self._iq2xs_dir:
             archive_path = os.path.join(self._iq2xs_dir, "experts.iq2xs")
             if os.path.exists(archive_path):
-                try:
-                    self._iq2xs_archive = IQ2XSArchiveReader(archive_path)
-                    print(f"[IQ2_XS] 使用归档文件: {archive_path}")
-                except Exception as e:
-                    print(f"[IQ2_XS] 归档打开失败: {e}")
+                self._iq2xs_archive_path = archive_path
+                print(f"[IQ2_XS] 归档文件已检测: {archive_path}（延迟打开）")
 
         # GPU 缓存：SLRU（热点稳定保留）
         self._gpu_cache = GpuSLRU(capacity=250)
@@ -442,35 +441,14 @@ class ExpertCache:
 
         self._stats["prefetch_misses"] += 1
 
-        # L2: CPU SLRU
-        cpu_params = self._cpu_cache.get(key)
-        if cpu_params is not None:
-            self._stats["cpu_hits"] += 1
-            self._layer_stats[layer_id]["cpu"] += 1
-            self._layer_stats[layer_id]["total"] += 1
-            # CPU 缓存只有 weight，需要从 RAM 读取 scale
-            # IQ2_XS 反量化为 FP8 后自带 scale，跳过 RAM scale
-            full_params = dict(cpu_params)
-            has_iq2_xs = any(isinstance(v, dict) and v.get("__iq2xs__") for v in full_params.values())
-            if not has_iq2_xs:
-                if layer_id in self.expert_key_map and expert_id in self.expert_key_map[layer_id]:
-                    for skey, shard_path in self.expert_key_map[layer_id][expert_id]:
-                        if 'scale' in skey and skey not in full_params:
-                            full_params[skey] = self._read_tensor_no_mmap(shard_path, skey, count_ram=True)
-            gpu_params = self._pinned_to_gpu(full_params, layer_id)
-            self._gpu_put(key, gpu_params)
-            # 路由预测预取
-            if topk_info is not None:
-                self.prefetch_by_route_prediction(layer_id, topk_info)
-            return gpu_params
-
-        # L3: SSD
-        self._stats["ssd_hits"] += 1
-        self._layer_stats[layer_id]["ssd"] += 1
-        self._layer_stats[layer_id]["total"] += 1
-
-        # IQ2_XS 模式：优先从归档读取 IQ2_XS 数据（而非 safetensors 的 FP4）
+        # IQ2_XS 模式：跳过 CPU SLRU，直接从 mmap 归档读取
+        # 归档文件通过 mmap + OS 页缓存已充当 CPU 缓存，无需重复存储
+        if self._iq2xs_archive_path is not None and self._iq2xs_archive is None:
+            self._ensure_iq2xs_archive()
         if self._iq2xs_archive is not None:
+            self._stats["ssd_hits"] += 1
+            self._layer_stats[layer_id]["ssd"] += 1
+            self._layer_stats[layer_id]["total"] += 1
             cpu_params = {}
             for weight_type, weight_name in enumerate(['w1', 'w2', 'w3']):
                 result = self._iq2xs_archive.get_expert(layer_id, expert_id, weight_type)
@@ -486,13 +464,36 @@ class ExpertCache:
                     "shape": shape,
                 }
             if cpu_params:
-                self._cpu_cache.put(key, cpu_params)
                 gpu_params = self._pinned_to_gpu(cpu_params, layer_id)
                 if gpu_params:
                     self._gpu_put(key, gpu_params)
                     if topk_info is not None:
                         self.prefetch_by_route_prediction(layer_id, topk_info)
                     return gpu_params
+
+        # FP4 模式：L2 CPU SLRU
+        cpu_params = self._cpu_cache.get(key)
+        if cpu_params is not None:
+            self._stats["cpu_hits"] += 1
+            self._layer_stats[layer_id]["cpu"] += 1
+            self._layer_stats[layer_id]["total"] += 1
+            # CPU 缓存只有 weight，需要从 RAM 读取 scale
+            full_params = dict(cpu_params)
+            if layer_id in self.expert_key_map and expert_id in self.expert_key_map[layer_id]:
+                for skey, shard_path in self.expert_key_map[layer_id][expert_id]:
+                    if 'scale' in skey and skey not in full_params:
+                        full_params[skey] = self._read_tensor_no_mmap(shard_path, skey, count_ram=True)
+            gpu_params = self._pinned_to_gpu(full_params, layer_id)
+            self._gpu_put(key, gpu_params)
+            # 路由预测预取
+            if topk_info is not None:
+                self.prefetch_by_route_prediction(layer_id, topk_info)
+            return gpu_params
+
+        # L3: SSD (FP4 模式)
+        self._stats["ssd_hits"] += 1
+        self._layer_stats[layer_id]["ssd"] += 1
+        self._layer_stats[layer_id]["total"] += 1
 
         # FP4 回退：从 safetensors 读取
         raw_tensors = {}
@@ -769,8 +770,14 @@ class ExpertCache:
             self._cpu_cache.put(key, cpu_params)
 
     def _transfer_gpu_to_cpu(self, key: tuple, gpu_params: dict):
-        """GPU 淘汰专家转存到 CPU 缓存（只存 weight，scale 从 RAM 读取）。"""
+        """GPU 淘汰专家转存到 CPU 缓存（只存 weight，scale 从 RAM 读取）。
+
+        IQ2_XS 模式下跳过，归档文件已充当 CPU 缓存。
+        """
         if not gpu_params:
+            return
+        # IQ2_XS 模式：不转存 CPU SLRU，归档文件通过 mmap 可直接读取
+        if self._iq2xs_archive is not None:
             return
         layer_id, expert_id = key
         try:
@@ -867,7 +874,7 @@ class ExpertCache:
                     "shape": shape,
                 }
             if cpu_params:
-                self._cpu_cache.put(key, cpu_params)
+                # IQ2_XS 模式：不存 CPU SLRU，直接异步传 GPU
                 gpu_params = {}
                 try:
                     with torch.cuda.stream(self._transfer_stream):
@@ -1016,8 +1023,13 @@ class ExpertCache:
 
             # IQ2_XS: dict 格式（含 d/qs/scales/__iq2xs__），直接 setattr 而非包装为 Parameter
             # model.py 的 linear() 函数通过 isinstance(weight, dict) 检测 IQ2_XS 并调用 iq2xs_gemm_optimized
+            # 注意：nn.Module.__setattr__ 不允许将已注册的 Parameter 替换为 dict，
+            # 需要先删除旧 Parameter 再设置新值
             if isinstance(tensor, dict) and tensor.get("__iq2xs__"):
-                setattr(module, final_attr, tensor)
+                if hasattr(module, final_attr):
+                    # 先从 _parameters 中移除，避免 __setattr__ 类型检查
+                    module._parameters.pop(final_attr, None)
+                object.__setattr__(module, final_attr, tensor)
                 continue
 
             requires_grad = tensor.is_floating_point() and tensor.dtype not in (
@@ -1134,7 +1146,19 @@ class ExpertCache:
     # ==================== RAM 预加载 ====================
 
     def preload_experts_to_ram(self):
-        """预加载全量 FP8 scale 到 RAM（ZipNN 压缩后仅 ~1.4GB）。"""
+        """预加载全量 FP8 scale 到 RAM（ZipNN 压缩后仅 ~1.4GB）。
+
+        仅 FP4 模式需要：路由专家 FP4 GEMM 使用 FP8 scale。
+        IQ2_XS 模式：路由专家使用归档中的 d/qs/scales，不需要 FP8 scale。
+        非路由专家（含共享专家）从 SSD5 加载后常驻 GPU，不走 CPU SLRU。
+        """
+        # IQ2_XS 模式：不需要 FP8 scale
+        if self._iq2xs_archive_path is not None or self._iq2xs_archive is not None:
+            print("[RAM Cache] IQ2_XS 模式：跳过 FP8 scale 预加载（路由专家使用归档 d/qs/scales）")
+            self._ram_cache_loaded = True
+            self._adjust_cpu_cache_capacity()
+            return
+
         import zipnn
         z = zipnn.ZipNN()
 
@@ -1143,7 +1167,7 @@ class ExpertCache:
             print(f"[RAM Cache] 可用 RAM 不足 ({available:.1f}GB), 跳过预加载")
             return
 
-        print(f"[RAM Cache] 开始预加载 FP8 scale (ZipNN): 可用 {available:.1f}GB")
+        print(f"[RAM Cache] 开始预加载 FP8 scale (ZipNN, FP4模式): 可用 {available:.1f}GB")
 
         total_scale_bytes_raw = 0
         total_scale_bytes_compressed = 0
@@ -1187,22 +1211,49 @@ class ExpertCache:
 
         self._adjust_cpu_cache_capacity()
 
-    def _adjust_cpu_cache_capacity(self):
-        """根据 RAM 资源动态调整 CPU 缓存容量。"""
-        used, available, _ = self.get_mem_info()
-        safe_mb = (available - self.MEM_SAFE_LIMIT_GB) * 1024
-        if safe_mb < 1000:
-            safe_mb = 1000
+    def _ensure_iq2xs_archive(self):
+        """延迟打开 IQ2XS 归档文件。在常驻权重加载完成后调用，避免与 safetensors 竞争页缓存。"""
+        if self._iq2xs_archive is not None:
+            return True
+        if self._iq2xs_archive_path is None:
+            return False
+        try:
+            self._iq2xs_archive = IQ2XSArchiveReader(self._iq2xs_archive_path)
+            print(f"[IQ2XSArchive] 打开归档: {self._iq2xs_archive_path}")
+            print(f"  层数: {self._iq2xs_archive.n_layers}, 专家数: {self._iq2xs_archive.n_experts}, 条目数: {len(self._iq2xs_archive._index)}")
+            return True
+        except Exception as e:
+            print(f"[IQ2_XS] 归档打开失败: {e}")
+            self._iq2xs_archive_path = None
+            return False
 
-        max_experts = int(safe_mb / self.EXPERT_MB)
+    def _adjust_cpu_cache_capacity(self):
+        """根据 RAM 资源动态调整 CPU 缓存容量。
+
+        IQ2_XS 模式：归档文件通过 mmap + OS 页缓存充当 CPU 缓存，CPU SLRU 容量极小。
+        FP4 模式：CPU SLRU 缓存热点专家，容量按可用内存最大化计算。
+        """
+        used, available, _ = self.get_mem_info()
+
+        # IQ2_XS 模式：归档文件通过 mmap + OS 页缓存充当 CPU 缓存
+        # 检查 _iq2xs_archive_path（归档可能延迟打开，_iq2xs_archive 还是 None）
+        if self._iq2xs_archive_path is not None or self._iq2xs_archive is not None:
+            max_experts = 0  # 不使用 CPU SLRU，mmap 归档充当 CPU 缓存
+            print(f"[Cache] CPU SLRU (IQ2_XS模式): capacity=0 (mmap归档充当CPU缓存)")
+        else:
+            # FP4 模式：大量 CPU SLRU 缓存，预留更少内存
+            safe_mb = (available - self.MEM_SAFE_LIMIT_GB_FP4) * 1024
+            if safe_mb < 1000:
+                safe_mb = 1000
+            max_experts = int(safe_mb / self.EXPERT_MB)
+            print(f"[Cache] CPU SLRU (FP4模式): capacity={max_experts} experts ({max_experts * self.EXPERT_MB / 1024:.1f}GB)")
+
         self._cpu_cache.capacity = max_experts
         self._cpu_cache.protected_capacity = int(max_experts * 0.3)
         self._cpu_cache.probation_capacity = max_experts - self._cpu_cache.protected_capacity
         self.cpu_cache_size = max_experts
 
-        print(f"[Cache] CPU SLRU: capacity={max_experts} experts ({max_experts * self.EXPERT_MB / 1024:.1f}GB), "
-              f"protected={self._cpu_cache.protected_capacity}/probation={self._cpu_cache.probation_capacity}, "
-              f"可用RAM={available:.1f}GB")
+        print(f"[Cache] CPU SLRU: protected={self._cpu_cache.protected_capacity}/probation={self._cpu_cache.probation_capacity}, 可用RAM={available:.1f}GB")
 
     # ==================== 热启动 ====================
 
@@ -1324,15 +1375,15 @@ class ExpertCache:
         print(f"[IQ2_XS] mmap 预热完成: {total_size / 1024**3:.2f} GB 已载入内存")
 
     def load_iq2xs_to_cpu(self, top_n_per_layer: int = 100):
-        """从 IQ2_XS 归档加载热点专家到 CPU 缓存。
+        """IQ2_XS 模式下不再预加载到 CPU SLRU。
 
-        Args:
-            top_n_per_layer: 每层加载的热点专家数（按频率统计）
+        归档文件通过 mmap + OS 页缓存已充当 CPU 缓存，
+        无需在 CPU SLRU 中重复存储。GPU 缓存仍由 SLRU 管理。
         """
         if self._iq2xs_archive is None:
-            print("[IQ2_XS] 无归档文件，跳过 CPU 加载")
+            print("[IQ2_XS] 无归档文件，跳过")
             return
-        self._load_iq2xs_from_archive(top_n_per_layer)
+        print(f"[IQ2_XS] 跳过 CPU 预加载（mmap 归档 + OS 页缓存充当 CPU 缓存）")
 
     def _load_iq2xs_from_archive(self, top_n_per_layer: int):
         """从归档文件加载热点专家到 CPU 缓存。
@@ -1388,7 +1439,7 @@ class ExpertCache:
         print(f"[IQ2_XS] 从归档加载: {loaded} 个权重")
 
     def warmup_from_cache(self, model):
-        """热启动: 从频率统计加载热点专家到 CPU + GPU。"""
+        """热启动: 从频率统计加载热点专家到 GPU。"""
         if self._n_layers <= 0:
             return
 
@@ -1396,6 +1447,12 @@ class ExpertCache:
         if effective_model is None:
             return
 
+        # IQ2_XS 模式：直接从归档加载热点专家到 GPU，跳过 CPU SLRU
+        if self._iq2xs_archive is not None:
+            self._warmup_iq2xs_from_archive(effective_model)
+            return
+
+        # FP4 模式：Phase1 → CPU SLRU, Phase2 → GPU
         # Phase 1: 全层 TopN → CPU SLRU
         # 根据 CPU 缓存容量限制加载数量，避免加载后立即被淘汰
         phase1_loaded = 0
@@ -1493,6 +1550,83 @@ class ExpertCache:
         gpu_total = self._gpu_cache.total_entries()
         cpu_total = self._cpu_cache.total_entries()
         print(f"[Cache] Warmup done: GPU={gpu_total}, CPU={cpu_total}")
+
+    def _warmup_iq2xs_from_archive(self, model):
+        """IQ2_XS 模式热启动：直接从归档加载热点专家到 GPU。
+
+        跳过 CPU SLRU，归档文件通过 mmap + OS 页缓存充当 CPU 缓存。
+        同时预热 mmap 页面，减少推理时的 page fault。
+        """
+        import time as _time
+        archive = self._iq2xs_archive
+        if archive is None:
+            return
+
+        vram_free = self._vram_free_mb()
+        budget = int((vram_free - self.VRAM_RESERVE_MB) / self.EXPERT_MB)
+        loaded = 0
+        mmap_pages_loaded = 0
+        t0 = _time.time()
+
+        # 预热所有层的热点专家到 GPU（前 10 层优先）
+        # 同时预热 mmap 页面（顺序读取，让 OS 预加载）
+        priority_layers = list(range(min(10, self._n_layers)))
+        other_layers = list(range(10, self._n_layers))
+
+        for layer_id in priority_layers + other_layers:
+            if loaded >= budget:
+                break
+            top_experts = self._get_top_n_experts_for_layer(layer_id)
+            if not top_experts:
+                top_experts = list(range(min(12, 256)))
+            for eid in top_experts:
+                if loaded >= budget:
+                    break
+                key = (layer_id, eid)
+                if self._gpu_cache.contains(key):
+                    continue
+
+                # 从归档读取 IQ2_XS 数据（同时预热 mmap 页面）
+                cpu_params = {}
+                for weight_type, weight_name in enumerate(['w1', 'w2', 'w3']):
+                    result = archive.get_expert(layer_id, eid, weight_type)
+                    if result is None:
+                        continue
+                    d, qs, scales, shape = result
+                    mmap_pages_loaded += d.nbytes + qs.nbytes + scales.nbytes
+                    skey = f"model.layers.{layer_id}.ffn.experts.{eid}.{weight_name}.weight"
+                    cpu_params[skey] = {
+                        "__iq2xs__": True,
+                        "d": torch.from_numpy(d),
+                        "qs": torch.from_numpy(qs),
+                        "scales": torch.from_numpy(scales),
+                        "shape": shape,
+                    }
+
+                if not cpu_params:
+                    continue
+
+                try:
+                    gpu_params = self._pinned_to_gpu(cpu_params, layer_id)
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    break
+
+                if gpu_params:
+                    self._gpu_put(key, gpu_params)
+                    moe = model.layers[layer_id].ffn
+                    if eid < len(moe.experts) and moe.experts[eid] is None:
+                        with torch.device('cpu'):
+                            moe._ensure_expert(eid)
+                        expert = moe.experts[eid]
+                        if expert is not None:
+                            self._set_expert_params(expert, gpu_params)
+                    loaded += 1
+
+        elapsed = _time.time() - t0
+        gpu_total = self._gpu_cache.total_entries()
+        mmap_mb = mmap_pages_loaded / 1024 / 1024
+        print(f"[Cache] IQ2_XS warmup: {loaded} experts → GPU, {mmap_mb:.0f}MB mmap pages in {elapsed:.1f}s, GPU total={gpu_total}")
 
     def prefetch_by_route_prediction(
         self,

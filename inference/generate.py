@@ -337,10 +337,25 @@ def load_weights_streaming(model: Transformer, ckpt_path: str, rank: int, world_
             shard_resident_keys[sp] = []
         shard_resident_keys[sp].append(key)
 
+    # 顺序预热页缓存：safe_open 使用 mmap 随机访问，直接访问会导致大量随机 page fault
+    # 先用 fadvise WILLNEED 提示 OS 预读，减少随机 I/O 延迟
+    import time as _time
+    preload_start = _time.time()
+    for shard_path in shard_resident_keys:
+        try:
+            fd = os.open(shard_path, os.O_RDONLY | os.O_DIRECT)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+            os.close(fd)
+        except (OSError, AttributeError):
+            pass
+    preload_elapsed = _time.time() - preload_start
+    print(f"[Streaming] fadvise WILLNEED for {len(shard_resident_keys)} shards: {preload_elapsed:.1f}s")
+
     # 常驻权重使用 safe_open 加载（启动时一次性操作）
-    # safe_open 的 mmap 页缓存在加载完后会被 OS 逐步回收
-    # 运行时专家加载使用 _read_tensor_no_mmap 避免 mmap 页缓存膨胀
-    for shard_path, keys in shard_resident_keys.items():
+    load_start = _time.time()
+    for shard_idx, (shard_path, keys) in enumerate(shard_resident_keys.items()):
+        shard_name = os.path.basename(shard_path)
+        t0 = _time.time()
         state_dict = {}
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for key in keys:
@@ -354,6 +369,11 @@ def load_weights_streaming(model: Transformer, ckpt_path: str, rank: int, world_
         model.load_state_dict(state_dict, strict=False, assign=True)
         del state_dict
         gc.collect()
+        elapsed = _time.time() - t0
+        print(f"  [{shard_idx+1}/{len(shard_resident_keys)}] {shard_name}: {len(keys)} keys, {elapsed:.1f}s")
+
+    total_load_time = _time.time() - load_start
+    print(f"[Streaming] Loaded all resident keys in {total_load_time:.1f}s")
 
     # 将常驻权重搬到 GPU，路由专家留在 CPU（按需加载）
     print("[Streaming] Moving resident weights to GPU...")
@@ -441,14 +461,7 @@ def _load_activated_experts(moe, activated_indices: list) -> None:
 
     # 验证专家权重在 GPU 上（仅首次推理前3层打印）
     if layer_id <= 2 and not hasattr(moe, '_debug_printed'):
-        for eid in list(all_gpu_params.keys())[:1]:
-            expert = moe.experts[eid]
-            if expert is not None:
-                w_dev = expert.w1.weight.device
-                gp_keys = [k for k in all_gpu_params[eid] if not k.startswith("__")]
-                print(f"[DEBUG] L{layer_id} E{eid}: w1.weight.device={w_dev}, keys={gp_keys}")
-        if layer_id == 2:
-            moe._debug_printed = True
+        moe._debug_printed = True
 
     cache.prefetch_next_layer(layer_id, activated_indices)
 
@@ -546,7 +559,9 @@ def generate(
     # - 对于长度大于 min(prompt_lens) 的序列，第一个 forward 会处理多个 prompt tokens（prefill）。
     # - 所有序列在 cur_pos 达到各自 prompt 长度后进入逐 token decode 阶段。
     for cur_pos in range(min(prompt_lens), total_len):
+        t0 = __import__('time').time()
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        fwd_ms = (__import__('time').time() - t0) * 1000
         if temperature > 0:
             next_token = sample(logits, temperature)
         else:
@@ -557,10 +572,17 @@ def generate(
         # 仅在非 prompt 位置检查是否生成了 eos_id，更新 finished 状态。
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
         prev_pos = cur_pos
+
+        # 推理进度日志：每步打印 forward 耗时和缓存统计
+        cache = getattr(model, '_expert_cache', None)
+        if cache is not None and cur_pos % 5 == 0:
+            s = cache._stats
+            print(f"[Step {cur_pos}] fwd={fwd_ms:.0f}ms gpu={s['gpu_hits']} cpu={s['cpu_hits']} "
+                  f"ssd={s['ssd_hits']} pf_hit={s['prefetch_hits']}", flush=True)
+
         # 每 10 个 token 检查内存压力并回收
         if cur_pos % 10 == 0:
             gc.collect()
-            cache = getattr(model, '_expert_cache', None)
             if cache is not None:
                 cache.check_memory_pressure()
                 cache.finalize_prefetch()
@@ -767,11 +789,15 @@ def main(
     # 必须在 torch.set_default_device("cuda") 之后，因为模型内部创建的索引张量需要在 GPU 上
     expert_cache = getattr(model, '_expert_cache', None)
     if expert_cache is not None:
+        # IQ2_XS: 延迟打开归档（常驻权重已加载完，页缓存不再竞争）
+        if iq2xs_dir:
+            expert_cache._ensure_iq2xs_archive()
+
         cache_loaded = expert_cache.load_cache_state()
         total_freq = expert_cache.total_freq_entries()
-        # IQ2_XS 归档加载
+        # IQ2_XS 归档加载（跳过 CPU SLRU，归档通过 mmap 按需读取）
         if iq2xs_dir:
-            expert_cache.load_iq2xs_to_cpu(top_n_per_layer=100)
+            expert_cache.load_iq2xs_to_cpu()
         if cache_loaded and total_freq:
             print("[Warmup] Hot restart: using persisted LFU stats, skipping inference warmup")
             expert_cache.warmup_from_cache(model)
@@ -798,9 +824,16 @@ def main(
             expert_cache.warmup_from_cache(model)
             expert_cache.save_cache_state()
 
-        # IQ2_XS mmap 预热
-        if iq2xs_dir:
-            expert_cache.warmup_iq2xs_mmap()
+        # IQ2_XS: 设置 mmap 访问模式
+        # 不使用 MADV_RANDOM（会禁止 OS 预读，导致大量 page fault）
+        # 使用默认模式，让 OS 根据访问模式自动调整预读
+        if iq2xs_dir and expert_cache._iq2xs_archive is not None:
+            try:
+                import mmap as _mmap
+                expert_cache._iq2xs_archive._mmap.madvise(_mmap.MADV_WILLNEED)
+                print("[IQ2_XS] mmap 模式: WILLNEED（允许 OS 预读）")
+            except (AttributeError, OSError):
+                pass
 
     print("I'm DeepSeek 👋")
 

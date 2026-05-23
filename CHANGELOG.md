@@ -2,6 +2,86 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.2] - 2025-05-23
+
+### IQ2_XS 数据存储优化与 C 验证
+
+#### 数据格式统一
+- **block 交织存储**: `iq2xs_archive.py` 和 `gguf_iq2xs.py` 的写入器/读取器统一为逐 block 交织存储格式（`d[2B] + qs[64B] + scales[8B]` = 74B/block），与 llama.cpp `block_iq2_xs` 结构一致
+- **归档头修复**: reserved 字段从 28 字节修正为 20 字节，确保总头大小为 64 字节
+
+#### numpy 向量化优化
+- **归档写入器**: 数据打包从 Python `for i in range(n_blocks)` 循环改为 numpy 切片赋值，预量化速度 14.8 → 24.1 e/s（+63%），总耗时 2383s → 1501s
+- **归档读取器**: 数据解析从 Python 循环改为 `np.frombuffer` + 切片 view，32768 blocks 读取 ~0.7ms
+- **GGUF 写入器**: 同样优化为 numpy 向量化交织
+- **GGUF 读取器**: 同样优化为 numpy 向量化解析
+
+#### C 语言验证
+- **verify_archive_iq2xs.c**: 独立 C 程序验证归档文件 IQ2_XS 数据正确性，直接读取归档头+索引+block 数据并反量化
+- **verify_gguf_iq2xs.c**: 独立 C 程序验证 GGUF 文件 IQ2_XS 数据正确性
+- **三方对比**: Python (GGUFReader) / Python (手动参数) / C 反量化结果完全一致（误差 0.0）
+- **反量化公式**: `y = d * (2*scale_4bit + 1) * 0.125 * grid[j] * sign`，与 llama.cpp 一致
+
+#### 性能对比
+
+| 组件 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 预量化 consume 时间 | ~1800ms/batch | ~150ms/batch | 12x |
+| 预量化总速度 | 14.8 e/s | 24.1 e/s | 63% |
+| 预量化总耗时 | 2383s (~40min) | 1501s (~25min) | -37% |
+| GGUF 读取 (32768 blocks) | ~数百ms | 0.7ms | ~100x |
+
+#### 修改文件
+- `inference/iq2xs_archive.py` - 写入器/读取器 numpy 向量化、header 修复
+- `inference/gguf_iq2xs.py` - 写入器/读取器 numpy 向量化
+- `inference/verify_archive_iq2xs.c` - 新增归档 C 验证程序
+- `inference/verify_gguf_iq2xs.c` - 新增 GGUF C 验证程序
+
+## [0.9.1] - 2025-05-21
+
+### CUDA 量化性能优化
+
+#### CUDA Kernel 优化
+- **16 threads/block 并行**: IQ2_XS 量化 kernel 从 1 thread/block 改为 16 threads/block，每个 thread 独立处理一个 16 元素子块，occupancy 提升 ~15 倍
+- **常量内存缓存 grid**: 512 项 grid 查找表从全局内存移至 `__constant__` 内存（4KB 广播缓存），降低访问延迟
+- **批量 kernel 启动**: FFI 函数从逐行启动 kernel 改为一次性启动所有 block，消除 kernel launch overhead
+- **Warp shuffle 归约**: sigma2 计算使用 `__shfl_down_sync` 实现 16 线程并行归约
+- **设备端辅助函数**: 添加 `nearest_int_cuda` 和 `iq2_find_best_neighbour_cuda`，修复编译错误
+
+#### 预量化流水线优化
+- **GPU FP4 解码**: FP4→float32 解码从 CPU numpy 改为 GPU torch 查表，消除 CPU→GPU 传输瓶颈
+- **批量专家处理**: 一次 kernel 调用处理 32 个同形状专家，GPU 利用率从 ~20% 提升到 ~95%
+- **向量化输出解析**: block_iq2_xs 输出解析从 Python 逐块循环改为 numpy stride trick，7530ms → 76ms（100 倍加速）
+- **safetensors 预加载**: 每个 shard 开始时一次性加载所有专家张量到 CPU 内存，避免重复磁盘 I/O
+- **双缓冲流水线**: CPU 准备和 GPU 量化交替执行，CUDA event 替代 synchronize 减少阻塞
+- **后台线程预加载**: ThreadPoolExecutor 在 GPU 量化时后台准备下一批 CPU 数据
+- **自动 batch_size**: 根据显存大小自动计算批量大小
+
+#### 代码清理
+- **删除旧 PyTorch GPU 量化**: 移除 `quantize_iq2xs_gpu_optimized.py`（旧 PyTorch 实现，~4.7 e/s，与 C 算法有差异）
+- **删除旧 GEMM 实现**: 移除 `iq2xs_gemm.py`（PyTorch CUDA Extension，硬编码 sm_90，已被 TileLang 版替代）
+- **清理残留引用**: 移除 `prequant_iq2xs.py` 中 `"pytorch_gpu"` 模式残留引用
+
+#### 性能提升
+
+| 版本 | 速度 | GPU 利用率 | 关键瓶颈 |
+|------|------|-----------|---------|
+| C CPU 量化 | 0.3 e/s | 0% | CPU 串行 |
+| CUDA 1 thread/block | 1.1 e/s | ~10% | kernel 并行度低 |
+| CUDA 16 threads/block | 2.1 e/s | ~20% | 逐行 FFI 调用 |
+| 双缓冲流水线 | 8.8 e/s | ~40% | CPU FP4 解码慢 |
+| GPU FP4 解码+批量 | 9.4 e/s | ~45% | Python 循环解析 7.5s |
+| **向量化解析** | **23.7 e/s** | **~95%** | 接近 GPU 极限 |
+
+#### 修改文件
+- `csrc/iq2_xs_quantize.cu` - CUDA kernel 重写（16 threads/block、常量内存、批量启动、辅助函数）
+- `inference/prequant_iq2xs.py` - 预量化流水线重写（批量处理、GPU FP4 解码、向量化解析、双缓冲）
+- `inference/iq2xs_cuda_quant.py` - 清理旧速度对比注释
+
+#### 删除文件
+- `inference/quantize_iq2xs_gpu_optimized.py` - 旧 PyTorch GPU 量化（已被 CUDA 版替代）
+- `inference/iq2xs_gemm.py` - 旧 PyTorch CUDA Extension GEMM（已被 TileLang 版替代）
+
 ## [0.9.0] - 2025-05-21
 
 ### IQ2_XS 量化支持

@@ -105,13 +105,20 @@ class IQ2XSArchiveWriter:
             in_dim: 输入维度
         """
         n_blocks = d.shape[0]
-        
-        # 打包数据：d + qs + scales
-        d_bytes = d.astype(np.float16).tobytes()
-        qs_bytes = qs.astype(np.uint16).tobytes()
-        scales_bytes = scales.astype(np.uint8).tobytes()
-        
-        data = d_bytes + qs_bytes + scales_bytes
+
+        # 打包数据: 逐 block 交织存储 (与 GGUF/llama.cpp block_iq2_xs 一致)
+        # 每个 block: d(2B) + qs(64B) + scales(8B) = 74B
+        BLOCK_BYTES = 74
+        d_flat = d.astype(np.float16).ravel()
+        qs_flat = qs.astype(np.uint16).reshape(n_blocks, 32)
+        scales_flat = scales.astype(np.uint8).reshape(n_blocks, 8)
+
+        # 向量化交织: 避免逐 block Python 循环
+        block_arr = np.zeros((n_blocks, BLOCK_BYTES), dtype=np.uint8)
+        block_arr[:, 0:2] = d_flat.view(np.uint8).reshape(n_blocks, 2)
+        block_arr[:, 2:66] = qs_flat.view(np.uint8).reshape(n_blocks, 64)
+        block_arr[:, 66:74] = scales_flat.reshape(n_blocks, 8)
+        data = block_arr.tobytes()
         
         # 添加索引
         self.index.append(ExpertIndex(
@@ -146,7 +153,7 @@ class IQ2XSArchiveWriter:
             f.write(struct.pack('<Q', index_offset))
             f.write(struct.pack('<Q', index_size))
             f.write(struct.pack('<Q', data_offset))
-            f.write(b'\x00' * 20)  # reserved
+            f.write(b'\x00' * 20)  # reserved (64 - 44 = 20)
             
             # 索引表
             for entry in self.index:
@@ -196,9 +203,9 @@ class IQ2XSArchiveReader:
         self.n_layers, = struct.unpack('<I', header[8:12])
         self.n_experts, = struct.unpack('<I', header[12:16])
         self.n_weights, = struct.unpack('<I', header[16:20])
-        index_offset, = struct.unpack('<Q', header[24:32])
-        index_size, = struct.unpack('<Q', header[32:40])
-        self._data_offset, = struct.unpack('<Q', header[40:48])
+        index_offset, = struct.unpack('<Q', header[20:28])
+        index_size, = struct.unpack('<Q', header[28:36])
+        self._data_offset, = struct.unpack('<Q', header[36:44])
         
         # mmap 映射
         self._file.seek(0, 2)
@@ -208,13 +215,20 @@ class IQ2XSArchiveReader:
         # 读取索引表
         n_entries = index_size // INDEX_ENTRY_SIZE
         for i in range(n_entries):
-            offset = index_offset + i * INDEX_ENTRY_SIZE
-            entry_data = self._mmap[offset:offset + INDEX_ENTRY_SIZE]
+            entry_offset = index_offset + i * INDEX_ENTRY_SIZE
+            entry_data = self._mmap[entry_offset:entry_offset + INDEX_ENTRY_SIZE]
             
             layer_id, expert_id, weight_type = struct.unpack('<III', entry_data[0:12])
             n_blocks, out_dim, in_dim = struct.unpack('<III', entry_data[12:24])
             data_offset, = struct.unpack('<Q', entry_data[24:32])
             
+            # 跳过重复键（保留第一个）
+            key = (layer_id, expert_id, weight_type)
+            if key in self._index:
+                continue
+            
+            # 注意：写入器存储的是 data_offset + entry.offset（绝对偏移）
+            # 所以 data_offset 已经是绝对偏移，直接使用
             entry = ExpertIndex(
                 layer_id=layer_id,
                 expert_id=expert_id,
@@ -225,7 +239,7 @@ class IQ2XSArchiveReader:
                 offset=data_offset,
             )
             
-            self._index[(layer_id, expert_id, weight_type)] = entry
+            self._index[key] = entry
         
         print(f"[IQ2XSArchive] 打开归档: {self.filepath}")
         print(f"  层数: {self.n_layers}, 专家数: {self.n_experts}, 条目数: {n_entries}")
@@ -252,25 +266,35 @@ class IQ2XSArchiveReader:
         if entry is None:
             return None
         
-        # 从 mmap 读取数据
+        # 从 mmap 读取数据 (逐 block 交织存储: d(2)+qs(64)+scales(8)=74B)
         offset = entry.offset
         n_blocks = entry.n_blocks
-        
-        # d: n_blocks * 2B
-        d_size = n_blocks * 2
-        d_bytes = self._mmap[offset:offset + d_size]
-        d = np.frombuffer(d_bytes, dtype=np.float16).copy()
-        
-        # qs: n_blocks * 32 * 2B
-        qs_size = n_blocks * 32 * 2
-        qs_bytes = self._mmap[offset + d_size:offset + d_size + qs_size]
-        qs = np.frombuffer(qs_bytes, dtype=np.uint16).copy().reshape(n_blocks, 32)
-        
-        # scales: n_blocks * 8B
-        scales_size = n_blocks * 8
-        scales_bytes = self._mmap[offset + d_size + qs_size:offset + d_size + qs_size + scales_size]
-        scales = np.frombuffer(scales_bytes, dtype=np.uint8).copy()
-        
+        BLOCK_BYTES = 74
+
+        raw = self._mmap[offset:offset + n_blocks * BLOCK_BYTES]
+
+        # 向量化解析: 避免逐 block Python 循环
+        raw_arr = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, BLOCK_BYTES)
+        d = raw_arr[:, 0:2].copy().view(np.float16).reshape(n_blocks)
+        qs = raw_arr[:, 2:66].copy().view(np.uint16).reshape(n_blocks, 32)
+        scales = raw_arr[:, 66:74].copy()
+
+        # reshape 为 IQ2_XS GEMM kernel 期望的形状
+        # kernel 期望: d[N, n_blocks_per_row], qs[N, n_blocks_per_row, 32], scales[N, n_blocks_per_row, 8]
+        # 其中 N = out_dim, n_blocks_per_row = in_dim / 256
+        N = entry.out_dim
+        K = entry.in_dim
+        n_blocks_per_row = K // 256  # QK_K = 256
+
+        # d: [n_blocks] → [N, n_blocks_per_row]
+        d = d.reshape(N, n_blocks_per_row)
+
+        # qs: [n_blocks, 32] → [N, n_blocks_per_row, 32]
+        qs = qs.reshape(N, n_blocks_per_row, 32)
+
+        # scales: [n_blocks * 8] → [N, n_blocks_per_row, 8]
+        scales = scales.reshape(N, n_blocks_per_row, 8)
+
         return d, qs, scales, (entry.out_dim, entry.in_dim)
     
     def get_expert_weight_names(self, layer_id: int, expert_id: int) -> List[str]:

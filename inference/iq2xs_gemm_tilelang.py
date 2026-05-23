@@ -639,14 +639,21 @@ def test_correctness():
     error = (y_tilelang.float() - y_ref.float()).abs()
     max_error = error.max().item()
     mean_error = error.mean().item()
+    
+    # 相对误差（避免除零）
+    y_ref_abs = y_ref.float().abs()
+    y_ref_max = y_ref_abs.max().item()
+    relative_error = max_error / max(y_ref_max, 1.0)
 
     print(f"\n矩阵形状: x=[{M}, {K}], W=[{N}, {K}]")
     print(f"\n[误差分析]")
     print(f"  最大误差: {max_error:.6f}")
     print(f"  平均误差: {mean_error:.6f}")
+    print(f"  相对误差: {relative_error:.6f}")
 
-    if max_error < 1.0:
-        print("\n[结果] ✓ 正确性测试通过")
+    # BF16 精度约为 1/128 ≈ 0.78%，允许 2% 相对误差
+    if relative_error < 0.02:
+        print("\n[结果] ✓ 正确性测试通过（BF16 精度范围内）")
         return True
     else:
         print("\n[结果] ✗ 正确性测试失败")
