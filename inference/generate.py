@@ -408,7 +408,20 @@ def load_weights_streaming(model: Transformer, ckpt_path: str, rank: int, world_
     expert_cache.adjust_window_for_vram()
     model._expert_cache = expert_cache
 
-    # 步骤 5：为每层 MoE 设置流式加载回调
+    # 步骤 5：为每层 MoE 设置流式加载回调 + CPU 推理运行器
+    from cpu_expert import CpuExpertRunner
+    cpu_runner = CpuExpertRunner(expert_cache)
+
+    # GPU-CPU 热专家同步：设置 GPU SLRU 引用
+    cpu_runner.set_gpu_cache(expert_cache._gpu_cache)
+
+    # 从 model config 动态获取 top-K（不同模型 top-K 不同：DS-V2=6, DS-V3=8, Mixtral=2）
+    gpu_topk = model.args.n_activated_experts if hasattr(model, 'args') else 8
+    cpu_runner.set_gpu_topk(gpu_topk)
+    print(f"[Streaming] GPU top-K = {gpu_topk} (from model config n_activated_experts)")
+
+    model._cpu_expert_runner = cpu_runner  # 保存到 model，供推理循环访问
+
     for layer_id, block in enumerate(model.layers):
         moe = block.ffn
         if layer_id in expert_key_map:
@@ -416,6 +429,7 @@ def load_weights_streaming(model: Transformer, ckpt_path: str, rank: int, world_
             moe._expert_cache = expert_cache
             moe._on_experts_needed = lambda activated, m=moe: _load_activated_experts(m, activated)
             moe._on_experts_done = lambda activated, m=moe: _unload_activated_experts(m, activated)
+            moe._cpu_expert_runner = cpu_runner
 
     total_expert_keys = sum(len(v) for v in routed_expert_keys.values())
     total_layers_with_experts = len(routed_expert_keys)
@@ -429,48 +443,50 @@ def load_weights_streaming(model: Transformer, ckpt_path: str, rank: int, world_
 def _load_activated_experts(moe, activated_indices: list) -> None:
     """使用 SLRU 缓存加载激活专家的权重到 GPU。
 
-    优化策略（100% pinned pool 模式）：
-    1. Gate 计算后立即并行 DMA 所有差集专家（从 pinned pool → GPU）
-    2. DMA 与 Expert 空壳创建重叠
-    3. 当前层加载完成后，立即预取 L+1 层差集
+    分层预加载策略（GPU miss → CPU FFN 优先）：
+    1. 所有激活专家记录频率（统一统计，驱动预取排序）
+    2. GPU SLRU 命中 → GPU GEMM (~0.2ms)
+    3. GPU SLRU miss → CPU FFN (~2.7ms)，跳过 DMA (~5.0ms)
+       CPU FFN 比 DMA 快，且 IQ2_XS 全量常驻内存 (100% 命中)
 
-    缓存查找顺序：L1 GPU SLRU → DMA 预取 → Pinned Pool → SSD
+    缓存查找顺序：L1 GPU SLRU → L2 CPU Rust SLRU → L3 Pinned Pool DMA
     """
     cache = moe._expert_cache
     layer_id = moe.layer_id
     cache.on_layer_start(layer_id)
 
-    # === 阶段 1：识别差集并并行预取 ===
-    # 差集 = 不在 GPU 缓存且不在预取队列中的专家
-    diff_keys = []
+    cpu_runner = moe._cpu_expert_runner
+
+    # === 阶段 0：统一频率统计 — 所有激活专家都计数 ===
+    # 无论走 GPU 还是 CPU，Gate 选中就记录频率
+    # 这是预取排序的唯一数据源
+    if cpu_runner is not None and hasattr(cpu_runner, '_rust_runner') and cpu_runner._rust_runner is not None:
+        for expert_id in activated_indices:
+            cpu_runner._rust_runner.record_access(layer_id, expert_id)
+            cpu_runner._access_freq[(layer_id, expert_id)] = \
+                cpu_runner._access_freq.get((layer_id, expert_id), 0) + 1
+
+    # === 阶段 1：识别 GPU 命中 / 差集 ===
     gpu_hit_ids = []
+    cpu_ffn_ids = []
 
     for expert_id in activated_indices:
         key = (layer_id, expert_id)
         if cache._gpu_cache.contains(key):
+            # GPU SLRU 命中 → GPU GEMM
             gpu_hit_ids.append(expert_id)
         else:
-            with cache._prefetch_lock:
-                in_prefetch = (layer_id in cache._prefetch_pending and
-                               expert_id in cache._prefetch_pending[layer_id])
-                in_iq2xs_prefetch = key in cache._iq2xs_prefetch_pending
-            if not in_prefetch and not in_iq2xs_prefetch:
-                diff_keys.append(key)
-
-    # 并行提交所有差集专家到预取线程池（非阻塞）
-    if diff_keys:
-        cache.prefetch_experts_batch(diff_keys)
+            # GPU miss → 优先走 CPU FFN
+            cpu_ffn_ids.append(expert_id)
 
     # === 阶段 2：处理 GPU 缓存命中的专家 ===
     for expert_id in gpu_hit_ids:
         with torch.device('cpu'):
             moe._ensure_expert(expert_id)
 
-    # === 阶段 3：处理差集专家（等待预取完成 + 设置参数） ===
+    # GPU 命中的专家：获取 GPU 参数
     all_gpu_params = {}
-    missed = []
-
-    for expert_id in activated_indices:
+    for expert_id in gpu_hit_ids:
         with torch.device('cpu'):
             moe._ensure_expert(expert_id)
         expert = moe.experts[expert_id]
@@ -480,26 +496,20 @@ def _load_activated_experts(moe, activated_indices: list) -> None:
         gpu_params = cache.get_expert_gpu_params(layer_id, expert_id)
         if gpu_params is not None:
             all_gpu_params[expert_id] = gpu_params
-        else:
-            missed.append(expert_id)
 
-    if missed and layer_id <= 2:
-        print(f"[WARN] L{layer_id}: {len(missed)} experts missed GPU params: {missed[:5]}")
+    # === 阶段 3：差集专家 → CPU FFN（跳过 DMA） ===
+    # CPU FFN (2.7ms) 比 DMA (5.0ms) 快，优先走 CPU
+    # 设置 expert = None 让 MoE.forward() 走 CPU 路径
+    for expert_id in cpu_ffn_ids:
+        if expert_id < len(moe.experts):
+            moe.experts[expert_id] = None
 
-    # 未获取到 GPU 参数的专家必须置 None，防止 fp4_gemm 收到 CPU 权重
-    for eid in missed:
-        if eid < len(moe.experts):
-            moe.experts[eid] = None
-
+    # 设置 GPU 命中专家的参数
     for expert_id, gpu_params in all_gpu_params.items():
         expert = moe.experts[expert_id]
         if expert is None:
             continue
         cache._set_expert_params(expert, gpu_params)
-
-    # 验证专家权重在 GPU 上（仅首次推理前3层打印）
-    if layer_id <= 2 and not hasattr(moe, '_debug_printed'):
-        moe._debug_printed = True
 
     # === 阶段 4：预取下一层 ===
     cache.prefetch_next_layer(layer_id, activated_indices)
@@ -598,10 +608,15 @@ def generate(
     # - 对于长度大于 min(prompt_lens) 的序列，第一个 forward 会处理多个 prompt tokens（prefill）。
     # - 所有序列在 cur_pos 达到各自 prompt 长度后进入逐 token decode 阶段。
     for cur_pos in range(min(prompt_lens), total_len):
-        # Step 开始：重置 step 级别保护集合
+        # Step 开始：重置 step 级别保护集合 + GPU-CPU 热专家同步
         cache = getattr(model, '_expert_cache', None)
         if cache is not None:
             cache.on_step_start(cur_pos)
+
+        # CPU runner 同步：预加载 GPU 热专家到 Rust SLRU
+        cpu_runner = getattr(model, '_cpu_expert_runner', None)
+        if cpu_runner is not None:
+            cpu_runner.on_step_start(cur_pos)
 
         t0 = __import__('time').time()
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
@@ -631,6 +646,10 @@ def generate(
         # Step 结束：清理 step 级别保护
         if cache is not None:
             cache.on_step_end()
+
+        # CPU runner step 结束
+        if cpu_runner is not None:
+            cpu_runner.on_step_end()
 
         # 每 10 个 token 检查内存压力并回收
         if cur_pos % 10 == 0:

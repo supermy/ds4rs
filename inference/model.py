@@ -1010,6 +1010,8 @@ class MoE(nn.Module):
         # _on_experts_done(activated_indices): 专家计算后调用，卸载专家释放 GPU 显存
         self._on_experts_needed = None
         self._on_experts_done = None
+        # CPU 专家推理运行器：GPU 缓存未命中时走 CPU 推理
+        self._cpu_expert_runner = None
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
 
@@ -1076,11 +1078,37 @@ class MoE(nn.Module):
             idx, top = torch.where(indices == i)
             expert_inputs[i] = (x[idx], idx, top)
 
-        # 逐专家计算（串行，避免多 Stream 并行导致 OOM）
+        # 逐专家计算：GPU 命中走 GPU，未命中走 CPU（混合推理）
+        gpu_count = 0
+        cpu_count = 0
         for i in expert_inputs:
             expert = self.experts[i]
             xi, idx, top = expert_inputs[i]
-            y[idx] += expert(xi, weights[idx, top, None])
+
+            if expert is not None:
+                # GPU 路径：专家权重已在 GPU 上
+                y[idx] += expert(xi, weights[idx, top, None])
+                gpu_count += 1
+            else:
+                # CPU 路径：专家权重不在 GPU 缓存中，走 CPU 推理
+                if self._cpu_expert_runner is not None:
+                    for k in range(xi.shape[0]):
+                        cpu_out = self._cpu_expert_runner.compute_expert_cpu(
+                            self.layer_id, i, xi[k], route_weight=weights[idx[k], top[k], 0].item(),
+                            swiglu_limit=self._expert_swiglu_limit
+                        )
+                        y[idx[k]] += cpu_out
+                    cpu_count += 1
+                # else: 无 CPU 推理能力，跳过（输出为 0）
+
+        # 混合推理统计（每 10 层打印一次）
+        if cpu_count > 0 and self.layer_id % 10 == 0:
+            total = gpu_count + cpu_count
+            print(f"[MoE] L{self.layer_id}: GPU={gpu_count}/{total}, CPU={cpu_count}/{total}")
+
+        # 预取下一层热专家到 CPU Rust SLRU（在当前层计算完成后）
+        if self._cpu_expert_runner is not None:
+            self._cpu_expert_runner.prefetch_layer(self.layer_id + 1)
 
         # 流式卸载回调：专家计算完毕后释放 GPU 显存
         if self._on_experts_done is not None:

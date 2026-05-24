@@ -3,9 +3,13 @@ name = "ds4rs"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "ds4rs"
+crate-type = ["cdylib", "rlib"]
+
 [features]
 default = []
-dev = ["pyo3"]
+dev = ["pyo3", "numpy"]
 
 [dependencies]
 cudarc = { version = "0.17", features = ["cuda-12090", "cublaslt", "cublas"] }
@@ -20,15 +24,19 @@ memmap2 = "0.9"
 anyhow = "1"
 tokenizers = "0.21"
 rand = "0.9"
-pyo3 = { version = "0.23", features = ["auto-initialize"], optional = true }
+rayon = "1.10"
+pyo3 = { version = "0.23", optional = true, features = ["extension-module"] }
+numpy = { version = "0.23", optional = true }
 
 [[bin]]
 name = "ds4_cli"
 path = "src/bin/ds4_cli.rs"
+required-features = ["default"]
 
 [[bin]]
 name = "test_iq2_xs_quant"
 path = "src/bin/test_iq2_xs_quant.rs"
+required-features = ["default"]
 
 [build-dependencies]
 cc = "1"

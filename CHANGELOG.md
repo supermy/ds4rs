@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.5] - 2025-05-23
+
+### CPU 专家推理 + 混合推理架构
+
+#### CPU 专家推理模块 (cpu_expert.py)
+
+- **IQ2_XS 反量化**: numpy 向量化实现，tile 分块（512 blocks/tile < L2 缓存）
+- **CPU 专家 FFN**: gate/up 配对投影 + SwiGLU + down 投影
+- **CpuExpertRunner**: 管理 pinned pool 数据和 CPU 计算，D2H/H2D 传输
+- **优化**: FMA（numpy BLAS 自动利用 AVX-512）、L1/L2 命中最大化（连续内存布局）、符号乘法代替 where
+
+#### TDD 测试 (test_cpu_expert.py)
+
+- 10/10 测试全部通过
+- 反量化延迟基准：159ms（gate_up 权重 131072 blocks）
+- CPU FFN 延迟基准：123ms（dim=4096, inter_dim=2048）
+
+#### 混合推理集成
+
+- model.py: MoE.forward 添加 hot/cold 双路分发
+  - GPU 命中：GPU GEMM 推理（~0.2ms/专家）
+  - GPU 未命中 + pinned pool 命中：DMA 传输到 GPU 推理（~5ms/专家）
+  - GPU 未命中 + CPU 路径：CPU 反量化 + FFN + H2D（~123ms/专家，待优化）
+- generate.py: 初始化 CpuExpertRunner，为每层 MoE 设置 CPU 推理回调
+
+#### 第三方代码 (third/)
+
+- `third/ds4/`: 官方 C 推理引擎（IQ2_XXS + ARM NEON + MoE FFN）
+- `third/llama.cpp/`: llama.cpp DS4 分支（IQ2_XS AVX2 + 热/冷双路 MoE + AVX-512 GEMM）
+- `third/README.md`: 完整分析文档和 Rust 实施计划
+
+#### 性能对比
+
+| 路径 | 延迟/专家 | 适用场景 |
+|------|----------|---------|
+| GPU SLRU 命中 | ~0.2ms | 热点专家 |
+| Pinned pool → DMA → GPU | ~5ms | 冷专家（当前默认） |
+| CPU 反量化 + FFN | ~123ms | 无 GPU 时兜底 |
+
+#### Review #1-#10 优化要点
+
+1. Tile 分块：512 blocks/tile，确保 L2 缓存命中
+2. FMA：numpy BLAS 自动利用 AVX-512 FMA 指令
+3. L1/L2 命中：连续内存布局（np.ascontiguousarray）
+4. 符号乘法：`1 - 2*bit` 代替 `np.where`，消除分支
+5. Scale 解码：位操作向量化，避免 Python 循环
+6. unpackbits：一次性解包 8 个符号位
+7. 配对投影：gate+up 共享输入，减少一次矩阵乘法
+8. 内存对齐：64 字节对齐，确保 AVX-512 对齐访问
+9. 预取策略：CPU 计算时预取下一批专家权重到 L3
+10. 线程池：多线程并行计算多个专家（待实现）
+
 ## [0.9.4] - 2025-05-23
 
 ### GPU 缓存策略深度优化

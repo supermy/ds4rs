@@ -1,3 +1,4 @@
+pub mod cpu_expert;
 pub mod cache;
 pub mod compressor;
 pub mod config;
@@ -22,6 +23,7 @@ pub mod weight;
 
 pub use cache::{CacheStats, GpuExpertCache, RamExpertCache, SsdExpertCache, ThreeLevelCache};
 pub use config::ModelConfig;
+pub use cpu_expert::kernel::cpu_expert_ffn_pair;
 pub use cublas::CublasHandle;
 pub use dtype::DType;
 pub use expert::{ExpertScheduler, ExpertWeights};
@@ -37,3 +39,13 @@ pub use tensor::{CpuTensor, GpuTensor};
 pub use tokenizer::{Tokenizer, ChatMessage, encode_chat, parse_assistant_response};
 pub use tvm_ffi::{init_tvm_runtime, KernelRegistry, TlKernel, TvmRuntime};
 pub use weight::WeightLoader;
+
+#[cfg(feature = "dev")]
+use pyo3::prelude::*;
+
+#[cfg(feature = "dev")]
+#[pymodule]
+fn ds4rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    cpu_expert::register_module(m)?;
+    Ok(())
+}
