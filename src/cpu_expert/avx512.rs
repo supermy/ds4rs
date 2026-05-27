@@ -1575,3 +1575,621 @@ pub unsafe fn iq2xs_vec_dot_q8_tile_avx512(
 
     0.125 * _mm512_reduce_add_ps(accumf)
 }
+
+// ============================================================
+// FP4 (e2m1 + E8M0) amd7600 专用内核
+// ============================================================
+
+/// E8M0 scale 转 f32（内联版本，避免函数调用开销）
+#[inline(always)]
+fn e8m0_to_f32_inline(bits: u8) -> f32 {
+    if bits == 0 {
+        0.0f32
+    } else {
+        f32::from_bits((bits as u32) << 23)
+    }
+}
+
+/// FP4 单线程顺序扫描矩阵向量乘法（amd7600 专用，x_split 版）
+///
+/// 优化策略：
+///   1. x_split 预拆分：将 x 拆分为 x_even/x_odd，lo 权重直接与 x_even 对齐
+///   2. 512-bit FMA + permutexvar_ps LUT 查表（16 个 FP4 值 → f32）
+///   3. 4 路累加器减少 FMA 依赖链延迟
+///   4. 循环展开 2 次 + 软件预取
+///   5. 单线程顺序扫描权重，最大化 DDR burst 效率
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn fp4_matvec_blocked_amd7600(
+    weight_packed: &[u8],
+    scale: &[u8],
+    x_even: &[f32],
+    x_odd: &[f32],
+    n_packed_per_row: usize,
+    n_scales_per_row: usize,
+    row_start: usize,
+    row_end: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let lut = _mm512_set_ps(
+        -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+         6.0,  4.0,  3.0,  2.0,  1.5,  1.0,  0.5, 0.0,
+    );
+
+    const BLOCK_SIZE: usize = 16;
+
+    for row in row_start..row_end {
+        if row + 1 < row_end {
+            let next_packed = weight_packed.as_ptr().add((row + 1) * n_packed_per_row);
+            _mm_prefetch(next_packed as *const i8, _MM_HINT_T1);
+        }
+
+        let row_packed_start = row * n_packed_per_row;
+        let row_scale_start = row * n_scales_per_row;
+        let n_full_blocks = n_packed_per_row / BLOCK_SIZE;
+
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+
+        let mut block = 0usize;
+
+        while block + 1 < n_full_blocks {
+            let base0 = row_packed_start + block * BLOCK_SIZE;
+            let scale_bits_0 = scale[row_scale_start + block];
+            let scale0 = if scale_bits_0 == 0 {
+                _mm512_set1_ps(0.0f32)
+            } else {
+                _mm512_set1_ps(e8m0_to_f32_inline(scale_bits_0))
+            };
+
+            if block + 2 < n_full_blocks {
+                let next_base = row_packed_start + (block + 2) * BLOCK_SIZE;
+                _mm_prefetch(weight_packed.as_ptr().add(next_base) as *const i8, _MM_HINT_T1);
+            }
+
+            let packed0 = _mm_loadu_si128(weight_packed.as_ptr().add(base0) as *const __m128i);
+            let lo0 = _mm_and_si128(packed0, _mm_set1_epi8(0xF));
+            let hi0 = _mm_srli_epi16(_mm_and_si128(packed0, _mm_set1_epi8(0xF0u8 as i8)), 4);
+
+            let lo_f32_0 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(lo0), lut), scale0);
+            let hi_f32_0 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(hi0), lut), scale0);
+
+            let x_even_0 = _mm512_loadu_ps(x_even.as_ptr().add(block * 16));
+            let x_odd_0 = _mm512_loadu_ps(x_odd.as_ptr().add(block * 16));
+
+            acc0 = _mm512_fmadd_ps(lo_f32_0, x_even_0, acc0);
+            acc1 = _mm512_fmadd_ps(hi_f32_0, x_odd_0, acc1);
+
+            let base1 = row_packed_start + (block + 1) * BLOCK_SIZE;
+            let scale_bits_1 = scale[row_scale_start + block + 1];
+            let scale1 = if scale_bits_1 == 0 {
+                _mm512_set1_ps(0.0f32)
+            } else {
+                _mm512_set1_ps(e8m0_to_f32_inline(scale_bits_1))
+            };
+
+            let packed1 = _mm_loadu_si128(weight_packed.as_ptr().add(base1) as *const __m128i);
+            let lo1 = _mm_and_si128(packed1, _mm_set1_epi8(0xF));
+            let hi1 = _mm_srli_epi16(_mm_and_si128(packed1, _mm_set1_epi8(0xF0u8 as i8)), 4);
+
+            let lo_f32_1 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(lo1), lut), scale1);
+            let hi_f32_1 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(hi1), lut), scale1);
+
+            let x_even_1 = _mm512_loadu_ps(x_even.as_ptr().add((block + 1) * 16));
+            let x_odd_1 = _mm512_loadu_ps(x_odd.as_ptr().add((block + 1) * 16));
+
+            acc2 = _mm512_fmadd_ps(lo_f32_1, x_even_1, acc2);
+            acc3 = _mm512_fmadd_ps(hi_f32_1, x_odd_1, acc3);
+
+            block += 2;
+        }
+
+        if block < n_full_blocks {
+            let base = row_packed_start + block * BLOCK_SIZE;
+            let scale_bits = scale[row_scale_start + block];
+            let scale_val = if scale_bits == 0 {
+                _mm512_set1_ps(0.0f32)
+            } else {
+                _mm512_set1_ps(e8m0_to_f32_inline(scale_bits))
+            };
+
+            let packed = _mm_loadu_si128(weight_packed.as_ptr().add(base) as *const __m128i);
+            let lo = _mm_and_si128(packed, _mm_set1_epi8(0xF));
+            let hi = _mm_srli_epi16(_mm_and_si128(packed, _mm_set1_epi8(0xF0u8 as i8)), 4);
+
+            let lo_f32 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(lo), lut), scale_val);
+            let hi_f32 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(hi), lut), scale_val);
+
+            let x_even_v = _mm512_loadu_ps(x_even.as_ptr().add(block * 16));
+            let x_odd_v = _mm512_loadu_ps(x_odd.as_ptr().add(block * 16));
+
+            acc0 = _mm512_fmadd_ps(lo_f32, x_even_v, acc0);
+            acc1 = _mm512_fmadd_ps(hi_f32, x_odd_v, acc1);
+        }
+
+        // 尾部
+        let mut tail_sum = 0.0f32;
+        let tail_start = n_full_blocks * BLOCK_SIZE;
+        for i in tail_start..n_packed_per_row {
+            let packed_byte = weight_packed[row_packed_start + i];
+            let lo_val = crate::cpu_expert::kernel::Fp4Weight::decode_fp4(packed_byte & 0xF);
+            let hi_val = crate::cpu_expert::kernel::Fp4Weight::decode_fp4((packed_byte >> 4) & 0xF);
+            let scale_lo = e8m0_to_f32_inline(scale[row_scale_start + (i * 2) / 32]);
+            let scale_hi = e8m0_to_f32_inline(scale[row_scale_start + (i * 2 + 1) / 32]);
+            tail_sum += lo_val * scale_lo * x_even[i];
+            tail_sum += hi_val * scale_hi * x_odd[i];
+        }
+
+        acc0 = _mm512_add_ps(acc0, acc1);
+        acc2 = _mm512_add_ps(acc2, acc3);
+        acc0 = _mm512_add_ps(acc0, acc2);
+
+        output[row - row_start] = _mm512_reduce_add_ps(acc0) + tail_sum;
+    }
+}
+
+/// FP4 单线程顺序扫描矩阵向量乘法（amd7600 专用，非 x_split 版）
+///
+/// 用于 down 投影（mid 不需要 x_split 预拆分）
+/// 使用 permutex2var_ps 交错合并 lo/hi 权重
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn fp4_matvec_blocked_amd7600_direct(
+    weight_packed: &[u8],
+    scale: &[u8],
+    x: &[f32],
+    n_packed_per_row: usize,
+    n_scales_per_row: usize,
+    row_start: usize,
+    row_end: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let lut = _mm512_set_ps(
+        -6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+         6.0,  4.0,  3.0,  2.0,  1.5,  1.0,  0.5, 0.0,
+    );
+
+    let merge_lo_idx = _mm512_set_epi32(
+        23, 7, 22, 6, 21, 5, 20, 4,
+        19, 3, 18, 2, 17, 1, 16, 0
+    );
+    let merge_hi_idx = _mm512_set_epi32(
+        31, 15, 30, 14, 29, 13, 28, 12,
+        27, 11, 26, 10, 25, 9, 24, 8
+    );
+
+    const BLOCK_SIZE: usize = 16;
+
+    for row in row_start..row_end {
+        if row + 1 < row_end {
+            let next_packed = weight_packed.as_ptr().add((row + 1) * n_packed_per_row);
+            _mm_prefetch(next_packed as *const i8, _MM_HINT_T1);
+        }
+
+        let row_packed_start = row * n_packed_per_row;
+        let row_scale_start = row * n_scales_per_row;
+        let n_full_blocks = n_packed_per_row / BLOCK_SIZE;
+
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+
+        let mut block = 0usize;
+
+        while block + 1 < n_full_blocks {
+            let base0 = row_packed_start + block * BLOCK_SIZE;
+            let scale_bits_0 = scale[row_scale_start + block];
+            let scale0 = if scale_bits_0 == 0 {
+                _mm512_set1_ps(0.0f32)
+            } else {
+                _mm512_set1_ps(e8m0_to_f32_inline(scale_bits_0))
+            };
+
+            if block + 2 < n_full_blocks {
+                let next_base = row_packed_start + (block + 2) * BLOCK_SIZE;
+                _mm_prefetch(weight_packed.as_ptr().add(next_base) as *const i8, _MM_HINT_T1);
+            }
+
+            let packed0 = _mm_loadu_si128(weight_packed.as_ptr().add(base0) as *const __m128i);
+            let lo0 = _mm_and_si128(packed0, _mm_set1_epi8(0xF));
+            let hi0 = _mm_srli_epi16(_mm_and_si128(packed0, _mm_set1_epi8(0xF0u8 as i8)), 4);
+
+            let lo_f32_0 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(lo0), lut), scale0);
+            let hi_f32_0 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(hi0), lut), scale0);
+
+            let w_first_0 = _mm512_permutex2var_ps(lo_f32_0, merge_lo_idx, hi_f32_0);
+            let w_second_0 = _mm512_permutex2var_ps(lo_f32_0, merge_hi_idx, hi_f32_0);
+
+            let x_base0 = block * BLOCK_SIZE * 2;
+            let x0_0 = _mm512_loadu_ps(x.as_ptr().add(x_base0));
+            let x0_1 = _mm512_loadu_ps(x.as_ptr().add(x_base0 + 16));
+
+            acc0 = _mm512_fmadd_ps(w_first_0, x0_0, acc0);
+            acc1 = _mm512_fmadd_ps(w_second_0, x0_1, acc1);
+
+            let base1 = row_packed_start + (block + 1) * BLOCK_SIZE;
+            let scale_bits_1 = scale[row_scale_start + block + 1];
+            let scale1 = if scale_bits_1 == 0 {
+                _mm512_set1_ps(0.0f32)
+            } else {
+                _mm512_set1_ps(e8m0_to_f32_inline(scale_bits_1))
+            };
+
+            let packed1 = _mm_loadu_si128(weight_packed.as_ptr().add(base1) as *const __m128i);
+            let lo1 = _mm_and_si128(packed1, _mm_set1_epi8(0xF));
+            let hi1 = _mm_srli_epi16(_mm_and_si128(packed1, _mm_set1_epi8(0xF0u8 as i8)), 4);
+
+            let lo_f32_1 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(lo1), lut), scale1);
+            let hi_f32_1 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(hi1), lut), scale1);
+
+            let w_first_1 = _mm512_permutex2var_ps(lo_f32_1, merge_lo_idx, hi_f32_1);
+            let w_second_1 = _mm512_permutex2var_ps(lo_f32_1, merge_hi_idx, hi_f32_1);
+
+            let x_base1 = (block + 1) * BLOCK_SIZE * 2;
+            let x1_0 = _mm512_loadu_ps(x.as_ptr().add(x_base1));
+            let x1_1 = _mm512_loadu_ps(x.as_ptr().add(x_base1 + 16));
+
+            acc2 = _mm512_fmadd_ps(w_first_1, x1_0, acc2);
+            acc3 = _mm512_fmadd_ps(w_second_1, x1_1, acc3);
+
+            block += 2;
+        }
+
+        if block < n_full_blocks {
+            let base = row_packed_start + block * BLOCK_SIZE;
+            let scale_bits = scale[row_scale_start + block];
+            let scale_val = if scale_bits == 0 {
+                _mm512_set1_ps(0.0f32)
+            } else {
+                _mm512_set1_ps(e8m0_to_f32_inline(scale_bits))
+            };
+
+            let packed = _mm_loadu_si128(weight_packed.as_ptr().add(base) as *const __m128i);
+            let lo = _mm_and_si128(packed, _mm_set1_epi8(0xF));
+            let hi = _mm_srli_epi16(_mm_and_si128(packed, _mm_set1_epi8(0xF0u8 as i8)), 4);
+
+            let lo_f32 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(lo), lut), scale_val);
+            let hi_f32 = _mm512_mul_ps(_mm512_permutexvar_ps(_mm512_cvtepi8_epi32(hi), lut), scale_val);
+
+            let w_first = _mm512_permutex2var_ps(lo_f32, merge_lo_idx, hi_f32);
+            let w_second = _mm512_permutex2var_ps(lo_f32, merge_hi_idx, hi_f32);
+
+            let x_base = block * BLOCK_SIZE * 2;
+            let x0 = _mm512_loadu_ps(x.as_ptr().add(x_base));
+            let x1 = _mm512_loadu_ps(x.as_ptr().add(x_base + 16));
+
+            acc0 = _mm512_fmadd_ps(w_first, x0, acc0);
+            acc1 = _mm512_fmadd_ps(w_second, x1, acc1);
+        }
+
+        // 尾部
+        let mut tail_sum = 0.0f32;
+        let tail_start = n_full_blocks * BLOCK_SIZE;
+        for i in tail_start..n_packed_per_row {
+            let packed_byte = weight_packed[row_packed_start + i];
+            let lo_val = crate::cpu_expert::kernel::Fp4Weight::decode_fp4(packed_byte & 0xF);
+            let hi_val = crate::cpu_expert::kernel::Fp4Weight::decode_fp4((packed_byte >> 4) & 0xF);
+            let col_lo = i * 2;
+            let col_hi = i * 2 + 1;
+            let scale_lo = e8m0_to_f32_inline(scale[row_scale_start + col_lo / 32]);
+            let scale_hi = e8m0_to_f32_inline(scale[row_scale_start + col_hi / 32]);
+            tail_sum += lo_val * scale_lo * x[col_lo];
+            tail_sum += hi_val * scale_hi * x[col_hi];
+        }
+
+        acc0 = _mm512_add_ps(acc0, acc1);
+        acc2 = _mm512_add_ps(acc2, acc3);
+        acc0 = _mm512_add_ps(acc0, acc2);
+
+        output[row - row_start] = _mm512_reduce_add_ps(acc0) + tail_sum;
+    }
+}
+
+// ============================================================
+// FP4+VNNI 内核（VPDPBUSD 替代 FMA 管线）
+// ============================================================
+
+/// FP4 e2m1 → int8 幅度 LUT（值 × 2 以保持整数）
+/// nibble 0-7: {0, 1, 2, 3, 4, 6, 8, 12}（正数幅度）
+/// nibble 8-15: 同上（符号由 sign LUT 单独处理）
+///
+/// 参考 llama.cpp kvalues_mxfp4: {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12}
+/// 区别：我们分离幅度和符号，因为 VPDPBUSD 要求第一操作数为 uint8
+const KVALUES_MXFP4_ABS: [u8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, 1, 2, 3, 4, 6, 8, 12];
+
+/// FP4 符号 LUT：nibble 0-7 为正（+1），nibble 8-15 为负（-1）
+/// sign_epi8(a, b): b>0 → a, b<0 → -a, b==0 → 0
+/// 因此正数用 +1（保持），负数用 -1（取反）
+const KSIGN_MXFP4: [i8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1];
+
+/// 将 x_even + x_odd 量化为 Q8_0 格式（32 元素/块，FP4 权重对齐布局）
+///
+/// 输出布局: q8[0:15] = Q8(x_even), q8[16:31] = Q8(x_odd)
+/// 与 FP4 权重布局对齐: lo nibbles → q8[0:15], hi nibbles → q8[16:31]
+///
+/// 返回 (q8_buf, q8_scales)，q8_scales[i] = 第 i 块的逆缩放因子
+pub fn quantize_f32_to_q8_fp4_split(
+    x_even: &[f32],
+    x_odd: &[f32],
+    n_blocks: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    let mut q8 = vec![0i8; n_blocks * 32];
+    let mut scales = vec![0.0f32; n_blocks];
+
+    for blk in 0..n_blocks {
+        let mut amax = 0.0f32;
+        for i in 0..16 {
+            amax = amax.max(x_even[blk * 16 + i].abs());
+            amax = amax.max(x_odd[blk * 16 + i].abs());
+        }
+        let inv_scale = if amax > 1e-6 { 127.0 / amax } else { 0.0 };
+        scales[blk] = if amax > 1e-6 { amax / 127.0 } else { 0.0 };
+
+        for i in 0..16 {
+            q8[blk * 32 + i] = (x_even[blk * 16 + i] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            q8[blk * 32 + 16 + i] = (x_odd[blk * 16 + i] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+        }
+    }
+
+    (q8, scales)
+}
+
+/// 将 x 量化为 Q8_0 格式（32 元素/块），同时重排为 FP4 权重对齐的顺序
+///
+/// 输出布局: q8[0:15] = Q8(x[0,2,4,...,30]), q8[16:31] = Q8(x[1,3,5,...,31])
+/// 用于 down 投影（mid 不需要预拆分，量化时直接重排）
+pub fn quantize_f32_to_q8_fp4_direct(
+    x: &[f32],
+    n_blocks: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    let mut q8 = vec![0i8; n_blocks * 32];
+    let mut scales = vec![0.0f32; n_blocks];
+
+    for blk in 0..n_blocks {
+        let base = blk * 32;
+        let mut amax = 0.0f32;
+        for i in 0..32 {
+            amax = amax.max(x[base + i].abs());
+        }
+        let inv_scale = if amax > 1e-6 { 127.0 / amax } else { 0.0 };
+        scales[blk] = if amax > 1e-6 { amax / 127.0 } else { 0.0 };
+
+        for i in 0..16 {
+            q8[blk * 32 + i] = (x[base + i * 2] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+            q8[blk * 32 + 16 + i] = (x[base + i * 2 + 1] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+        }
+    }
+
+    (q8, scales)
+}
+
+/// FP4+VNNI 单线程顺序扫描矩阵向量乘法（amd7600 专用，x_split 版）
+///
+/// 优化策略：
+///   1. FP4 nibble → uint8 幅度 + sign 分离（shuffle_epi8 LUT）
+///   2. sign_epi8(q8, sign_mask): 将权重符号应用到 Q8 激活
+///   3. VPDPBUSD(uint8_magnitude, int8_signed_activation) → int32
+///   4. cvtepi32_ps + fmadd_ps: SIMD 浮点累加（避免逐块 hsum）
+///   5. 2× 循环展开 + 双累加器
+///
+/// Q8 量化由调用方预计算（FFN 函数级别），避免 per-chunk 重复量化
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni")]
+pub unsafe fn fp4_matvec_vnni_amd7600(
+    weight_packed: &[u8],
+    scale: &[u8],
+    q8_buf: &[i8],
+    q8_scales: &[f32],
+    n_packed_per_row: usize,
+    n_scales_per_row: usize,
+    row_start: usize,
+    row_end: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let values128 = _mm_loadu_si128(KVALUES_MXFP4_ABS.as_ptr() as *const __m128i);
+    let signs128 = _mm_loadu_si128(KSIGN_MXFP4.as_ptr() as *const __m128i);
+    let m4b = _mm_set1_epi8(0xF);
+
+    const BLOCK_SIZE: usize = 16; // 16 packed bytes = 32 FP4 elements
+    let n_blocks = n_packed_per_row / BLOCK_SIZE;
+
+    for row in row_start..row_end {
+        if row + 1 < row_end {
+            let next_packed = weight_packed.as_ptr().add((row + 1) * n_packed_per_row);
+            _mm_prefetch(next_packed as *const i8, _MM_HINT_T1);
+        }
+
+        let row_packed_start = row * n_packed_per_row;
+        let row_scale_start = row * n_scales_per_row;
+
+        // 双累加器 + SIMD 浮点累加（避免逐块 hsum）
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+
+        // 2× 循环展开
+        let n_full = n_blocks & !1;
+        for block in (0..n_full).step_by(2) {
+            // --- Block 0 ---
+            let base0 = row_packed_start + block * BLOCK_SIZE;
+            let sc0 = _mm256_set1_ps(e8m0_to_f32_inline(scale[row_scale_start + block]) * q8_scales[block] * 0.5);
+
+            let packed0 = _mm_loadu_si128(weight_packed.as_ptr().add(base0) as *const __m128i);
+            let lo0 = _mm_and_si128(packed0, m4b);
+            let hi0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), m4b);
+            let lo_mag0 = _mm_shuffle_epi8(values128, lo0);
+            let hi_mag0 = _mm_shuffle_epi8(values128, hi0);
+            let lo_sign0 = _mm_shuffle_epi8(signs128, lo0);
+            let hi_sign0 = _mm_shuffle_epi8(signs128, hi0);
+            let w0 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_mag0), hi_mag0, 1);
+            let sgn0 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_sign0), hi_sign0, 1);
+            let q8_0 = _mm256_loadu_si256(q8_buf.as_ptr().add(block * 32) as *const __m256i);
+            let q8s_0 = _mm256_sign_epi8(q8_0, sgn0);
+            let dot0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w0, q8s_0);
+            acc0 = _mm256_fmadd_ps(sc0, _mm256_cvtepi32_ps(dot0), acc0);
+
+            // --- Block 1 ---
+            let base1 = row_packed_start + (block + 1) * BLOCK_SIZE;
+            let sc1 = _mm256_set1_ps(e8m0_to_f32_inline(scale[row_scale_start + block + 1]) * q8_scales[block + 1] * 0.5);
+
+            let packed1 = _mm_loadu_si128(weight_packed.as_ptr().add(base1) as *const __m128i);
+            let lo1 = _mm_and_si128(packed1, m4b);
+            let hi1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), m4b);
+            let lo_mag1 = _mm_shuffle_epi8(values128, lo1);
+            let hi_mag1 = _mm_shuffle_epi8(values128, hi1);
+            let lo_sign1 = _mm_shuffle_epi8(signs128, lo1);
+            let hi_sign1 = _mm_shuffle_epi8(signs128, hi1);
+            let w1 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_mag1), hi_mag1, 1);
+            let sgn1 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_sign1), hi_sign1, 1);
+            let q8_1 = _mm256_loadu_si256(q8_buf.as_ptr().add((block + 1) * 32) as *const __m256i);
+            let q8s_1 = _mm256_sign_epi8(q8_1, sgn1);
+            let dot1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w1, q8s_1);
+            acc1 = _mm256_fmadd_ps(sc1, _mm256_cvtepi32_ps(dot1), acc1);
+        }
+
+        // 处理奇数块
+        if n_blocks % 2 != 0 {
+            let block = n_blocks - 1;
+            let base = row_packed_start + block * BLOCK_SIZE;
+            let sc = _mm256_set1_ps(e8m0_to_f32_inline(scale[row_scale_start + block]) * q8_scales[block] * 0.5);
+            let packed = _mm_loadu_si128(weight_packed.as_ptr().add(base) as *const __m128i);
+            let lo = _mm_and_si128(packed, m4b);
+            let hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4b);
+            let lo_mag = _mm_shuffle_epi8(values128, lo);
+            let hi_mag = _mm_shuffle_epi8(values128, hi);
+            let lo_sign = _mm_shuffle_epi8(signs128, lo);
+            let hi_sign = _mm_shuffle_epi8(signs128, hi);
+            let w = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_mag), hi_mag, 1);
+            let sgn = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_sign), hi_sign, 1);
+            let q8 = _mm256_loadu_si256(q8_buf.as_ptr().add(block * 32) as *const __m256i);
+            let q8s = _mm256_sign_epi8(q8, sgn);
+            let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, q8s);
+            acc0 = _mm256_fmadd_ps(sc, _mm256_cvtepi32_ps(dot), acc0);
+        }
+
+        // 最终 hsum
+        let sum256 = _mm256_add_ps(acc0, acc1);
+        output[row - row_start] = hsum_ps256(sum256);
+    }
+}
+
+/// __m256 8×f32 水平求和
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_ps256(x: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let hi128 = _mm256_extractf128_ps(x, 1);
+    let lo128 = _mm256_castps256_ps128(x);
+    let sum128 = _mm_add_ps(hi128, lo128);
+    let s1 = _mm_movehl_ps(sum128, sum128);
+    let s2 = _mm_add_ps(sum128, s1);
+    let s3 = _mm_shuffle_ps(s2, s2, 0x01);
+    let s4 = _mm_add_ss(s2, s3);
+    _mm_cvtss_f32(s4)
+}
+
+/// FP4+VNNI 单线程顺序扫描矩阵向量乘法（amd7600 专用，direct 版）
+///
+/// 用于 down 投影：x 不预拆分，Q8 量化时直接重排为 FP4 权重对齐顺序
+/// q8[0:15] = Q8(x[0,2,...,30]), q8[16:31] = Q8(x[1,3,...,31])
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vnni")]
+pub unsafe fn fp4_matvec_vnni_amd7600_direct(
+    weight_packed: &[u8],
+    scale: &[u8],
+    q8_buf: &[i8],
+    q8_scales: &[f32],
+    n_packed_per_row: usize,
+    n_scales_per_row: usize,
+    row_start: usize,
+    row_end: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    let values128 = _mm_loadu_si128(KVALUES_MXFP4_ABS.as_ptr() as *const __m128i);
+    let signs128 = _mm_loadu_si128(KSIGN_MXFP4.as_ptr() as *const __m128i);
+    let m4b = _mm_set1_epi8(0xF);
+
+    const BLOCK_SIZE: usize = 16;
+    let n_blocks = n_packed_per_row / BLOCK_SIZE;
+
+    for row in row_start..row_end {
+        if row + 1 < row_end {
+            let next_packed = weight_packed.as_ptr().add((row + 1) * n_packed_per_row);
+            _mm_prefetch(next_packed as *const i8, _MM_HINT_T1);
+        }
+
+        let row_packed_start = row * n_packed_per_row;
+        let row_scale_start = row * n_scales_per_row;
+
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+
+        let n_full = n_blocks & !1;
+        for block in (0..n_full).step_by(2) {
+            let base0 = row_packed_start + block * BLOCK_SIZE;
+            let sc0 = _mm256_set1_ps(e8m0_to_f32_inline(scale[row_scale_start + block]) * q8_scales[block] * 0.5);
+
+            let packed0 = _mm_loadu_si128(weight_packed.as_ptr().add(base0) as *const __m128i);
+            let lo0 = _mm_and_si128(packed0, m4b);
+            let hi0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), m4b);
+            let lo_mag0 = _mm_shuffle_epi8(values128, lo0);
+            let hi_mag0 = _mm_shuffle_epi8(values128, hi0);
+            let lo_sign0 = _mm_shuffle_epi8(signs128, lo0);
+            let hi_sign0 = _mm_shuffle_epi8(signs128, hi0);
+            let w0 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_mag0), hi_mag0, 1);
+            let sgn0 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_sign0), hi_sign0, 1);
+            let q8_0 = _mm256_loadu_si256(q8_buf.as_ptr().add(block * 32) as *const __m256i);
+            let q8s_0 = _mm256_sign_epi8(q8_0, sgn0);
+            let dot0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w0, q8s_0);
+            acc0 = _mm256_fmadd_ps(sc0, _mm256_cvtepi32_ps(dot0), acc0);
+
+            let base1 = row_packed_start + (block + 1) * BLOCK_SIZE;
+            let sc1 = _mm256_set1_ps(e8m0_to_f32_inline(scale[row_scale_start + block + 1]) * q8_scales[block + 1] * 0.5);
+
+            let packed1 = _mm_loadu_si128(weight_packed.as_ptr().add(base1) as *const __m128i);
+            let lo1 = _mm_and_si128(packed1, m4b);
+            let hi1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), m4b);
+            let lo_mag1 = _mm_shuffle_epi8(values128, lo1);
+            let hi_mag1 = _mm_shuffle_epi8(values128, hi1);
+            let lo_sign1 = _mm_shuffle_epi8(signs128, lo1);
+            let hi_sign1 = _mm_shuffle_epi8(signs128, hi1);
+            let w1 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_mag1), hi_mag1, 1);
+            let sgn1 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_sign1), hi_sign1, 1);
+            let q8_1 = _mm256_loadu_si256(q8_buf.as_ptr().add((block + 1) * 32) as *const __m256i);
+            let q8s_1 = _mm256_sign_epi8(q8_1, sgn1);
+            let dot1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w1, q8s_1);
+            acc1 = _mm256_fmadd_ps(sc1, _mm256_cvtepi32_ps(dot1), acc1);
+        }
+
+        if n_blocks % 2 != 0 {
+            let block = n_blocks - 1;
+            let base = row_packed_start + block * BLOCK_SIZE;
+            let sc = _mm256_set1_ps(e8m0_to_f32_inline(scale[row_scale_start + block]) * q8_scales[block] * 0.5);
+            let packed = _mm_loadu_si128(weight_packed.as_ptr().add(base) as *const __m128i);
+            let lo = _mm_and_si128(packed, m4b);
+            let hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4b);
+            let lo_mag = _mm_shuffle_epi8(values128, lo);
+            let hi_mag = _mm_shuffle_epi8(values128, hi);
+            let lo_sign = _mm_shuffle_epi8(signs128, lo);
+            let hi_sign = _mm_shuffle_epi8(signs128, hi);
+            let w = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_mag), hi_mag, 1);
+            let sgn = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_sign), hi_sign, 1);
+            let q8 = _mm256_loadu_si256(q8_buf.as_ptr().add(block * 32) as *const __m256i);
+            let q8s = _mm256_sign_epi8(q8, sgn);
+            let dot = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, q8s);
+            acc0 = _mm256_fmadd_ps(sc, _mm256_cvtepi32_ps(dot), acc0);
+        }
+
+        let sum256 = _mm256_add_ps(acc0, acc1);
+        output[row - row_start] = hsum_ps256(sum256);
+    }
+}

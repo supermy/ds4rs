@@ -62,6 +62,15 @@ struct GpuWeightSlots {
     w2_scale_shape: Vec<usize>,
 }
 
+pub struct ExpertCpuWeightsRef<'a> {
+    pub w1: &'a CpuTensor,
+    pub w1_scale: &'a CpuTensor,
+    pub w3: &'a CpuTensor,
+    pub w3_scale: &'a CpuTensor,
+    pub w2: &'a CpuTensor,
+    pub w2_scale: &'a CpuTensor,
+}
+
 impl ExpertScheduler {
     pub fn new(device: Arc<CudaContext>, config: Arc<ModelConfig>) -> Self {
         let expert_dtype = DType::from_config_str(&config.expert_dtype)
@@ -476,6 +485,24 @@ impl ExpertScheduler {
             return Ok(());
         }
         self.load_expert(layer_id, expert_id, loader)
+    }
+
+    /// 获取 CPU 缓存中的专家权重引用（用于 CPU FFN 回退）
+    pub fn get_cpu_weights(&self, layer_id: usize, expert_id: usize) -> Option<ExpertCpuWeightsRef<'_>> {
+        let key = (layer_id, expert_id);
+        self.cpu_cache.get(&key).map(|w| ExpertCpuWeightsRef {
+            w1: &w.w1,
+            w1_scale: &w.w1_scale,
+            w3: &w.w3,
+            w3_scale: &w.w3_scale,
+            w2: &w.w2,
+            w2_scale: &w.w2_scale,
+        })
+    }
+
+    /// 检查 GPU 缓存中是否有该专家（用于 GPU hit/miss 决策）
+    pub fn gpu_cache_contains(&self, layer_id: usize, expert_id: usize) -> bool {
+        self.three_level.gpu.contains(layer_id, expert_id)
     }
 
     pub fn prefetch_next_layer(

@@ -30,3 +30,14 @@ translate_*.py
 DeepSeek_V4_raw.txt
 # .trae 本地配置
 .trae/
+# pip 残留
+=*
+# 大文件
+DeepSeek_V4.pdf
+gguf/
+# 临时文件
+bench_timeline.py
+debug_sign.py
+test_prompt.txt
+benchmarks/__pycache__/
+sagents/

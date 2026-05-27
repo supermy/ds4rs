@@ -458,8 +458,26 @@ def _load_activated_experts(moe, activated_indices: list) -> None:
 
     cpu_runner = moe._cpu_expert_runner
 
-    # IQ2_XXS+Q2_K 模式：所有专家走 CPU FFN，跳过 GPU 缓存
+    # IQ2_XXS+Q2_K 模式：GPU FFN + CPU FFN 混合路径
     if cpu_runner is not None and cpu_runner._mixed_pool is not None:
+        mixed_pool = cpu_runner._mixed_pool
+        if mixed_pool._gpu_ffn:
+            # GPU FFN 模式：一次命中准入 + CPU 回退 + 异步预取
+            for expert_id in activated_indices:
+                key = (layer_id, expert_id)
+                # 统一频率计数
+                if expert_id < len(moe.experts):
+                    moe.experts[expert_id] = None  # 标记为 None，由 compute_expert_cpu 处理
+
+                # 一次命中准入：记录频率，但不在推理热路径中同步上传
+                # 上传由异步预取和 warmup 完成，避免阻塞推理
+                mixed_pool.record_gpu_access(layer_id, expert_id)
+
+            # 预测性预取 L+1 层专家（后台异步上传，不阻塞推理）
+            mixed_pool.predictive_prefetch(layer_id, activated_indices)
+            return
+
+        # 纯 CPU FFN 模式：所有专家走 CPU
         for expert_id in activated_indices:
             if expert_id < len(moe.experts):
                 moe.experts[expert_id] = None
@@ -744,7 +762,7 @@ def generate(
 def _run_inference_loop(model, tokenizer, interactive, input_file,
                         max_new_tokens, temperature, repetition_penalty,
                         top_p, min_p, quant_type):
-    """IQ2_XXS+Q2_K 模式的推理循环：所有专家走 CPU FFN。"""
+    """IQ2_XXS+Q2_K 模式的推理循环：GPU FFN + CPU FFN 混合路径。"""
     # IQ2_XXS+Q2_K 推荐参数
     if temperature == 1.0:
         temperature = 0.6
@@ -753,6 +771,22 @@ def _run_inference_loop(model, tokenizer, interactive, input_file,
     if min_p == 0.0:
         min_p = 0.01
     print(f"[IQ2_XXS+Q2_K] temperature={temperature}, top_p={top_p}, min_p={min_p}")
+
+    # 获取 mixed_pool 引用
+    cpu_runner = getattr(model, '_cpu_expert_runner', None)
+    mixed_pool = cpu_runner._mixed_pool if cpu_runner else None
+
+    # 启用时间线分析
+    from model import enable_timing, print_timing as print_timeline, reset_timing
+    enable_timing()
+
+    def _print_stats(completion_tokens, stats):
+        """打印推理统计 + GPU FFN 统计 + 时间线。"""
+        print(f"[stats] {stats['total_tokens']} tokens in {stats['elapsed_sec']:.2f}s → {stats['tokens_per_sec']:.1f} t/s")
+        if mixed_pool is not None and mixed_pool._gpu_ffn:
+            mixed_pool.print_gpu_stats()
+        # 打印时间线分析
+        print_timeline(n_steps=stats['total_tokens'])
 
     if interactive:
         messages = []
@@ -775,7 +809,10 @@ def _run_inference_loop(model, tokenizer, interactive, input_file,
                     repetition_penalty, top_p, min_p)
             completion = tokenizer.decode(completion_tokens[0])
             print(completion)
-            print(f"\n[stats] {stats['total_tokens']} tokens in {stats['elapsed_sec']:.2f}s → {stats['tokens_per_sec']:.1f} t/s")
+            _print_stats(completion_tokens, stats)
+            # 每轮对话结束保存频率数据
+            if mixed_pool is not None and mixed_pool._gpu_ffn:
+                mixed_pool.save_freq()
             messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
     else:
         with open(input_file) as f:
@@ -792,7 +829,7 @@ def _run_inference_loop(model, tokenizer, interactive, input_file,
             print("Completion:", completion)
             print("Completion tokens[:30]:", ctoks[:30])
             print()
-        print(f"[stats] {stats['total_tokens']} tokens in {stats['elapsed_sec']:.2f}s → {stats['tokens_per_sec']:.1f} t/s")
+        _print_stats(completion_tokens, stats)
 
 
 def main(
@@ -808,6 +845,10 @@ def main(
     top_p: float = 1.0,
     min_p: float = 0.0,
     gguf_path: str = "",
+    gpu_ffn: bool = False,
+    gpu_cache_cap: int = 0,
+    prefetch_count: int = 50,
+    prefetch_layers: int = 1,
 ) -> None:
     """
     文本生成主入口函数，负责分布式环境初始化、模型加载、以及交互式/批处理推理。
@@ -1012,19 +1053,35 @@ def main(
     # 必须在 torch.set_default_device("cuda") 之后，因为模型内部创建的索引张量需要在 GPU 上
     expert_cache = getattr(model, '_expert_cache', None)
 
-    # IQ2_XXS+Q2_K 混合量化：初始化 MixedQuantExpertPool，所有专家走 CPU FFN
+    # IQ2_XXS+Q2_K 混合量化：初始化 MixedQuantExpertPool
     if quant_type == "iq2xxs_q2k":
         from rust_cpu_expert import MixedQuantExpertPool
-        mixed_pool = MixedQuantExpertPool(gguf_path)
+        mixed_pool = MixedQuantExpertPool(gguf_path, gpu_ffn=gpu_ffn, gpu_cache_capacity=gpu_cache_cap)
         cpu_runner = getattr(model, '_cpu_expert_runner', None)
         if cpu_runner is not None:
             cpu_runner.set_mixed_pool(mixed_pool)
-            print(f"[IQ2_XXS+Q2_K] Mixed pool initialized, all experts → CPU FFN")
+            if gpu_ffn:
+                # 配置预测性预取参数
+                mixed_pool.prefetch_count = prefetch_count
+                mixed_pool.prefetch_layers = prefetch_layers
+                # 热启动：利用持久化频率数据直接上传热专家
+                n_layers = len(model.layers) if hasattr(model, 'layers') else 43
+                mixed_pool.warmup_gpu_cache(n_layers=n_layers)
+                print(f"[IQ2_XXS+Q2_K] Mixed pool initialized, GPU FFN enabled "
+                      f"(2-hit admission, cap={gpu_cache_cap}, "
+                      f"prefetch={prefetch_count}×{prefetch_layers}L, "
+                      f"cache={mixed_pool.gpu_cache_size()}, vram={mixed_pool.gpu_cache_vram_mb():.1f}MB)")
+            else:
+                print(f"[IQ2_XXS+Q2_K] Mixed pool initialized, all experts → CPU FFN")
         # 跳过 GPU 缓存 warmup，所有专家走 CPU
         print("I'm DeepSeek 👋")
         _run_inference_loop(model, tokenizer, interactive, input_file,
                            max_new_tokens, temperature, repetition_penalty,
                            top_p, min_p, quant_type)
+        # 推理结束：保存频率数据
+        if gpu_ffn:
+            mixed_pool.save_freq()
+            mixed_pool.print_gpu_stats()
         return
 
     if expert_cache is not None:
@@ -1149,8 +1206,17 @@ if __name__ == "__main__":
                         help="IQ2_XS 量化文件目录（为空则自动检测）")
     parser.add_argument("--gguf-path", type=str, default="",
                         help="IQ2_XXS+Q2_K GGUF 文件路径（iq2xxs_q2k 模式）")
+    parser.add_argument("--gpu-ffn", action="store_true", default=False,
+                        help="iq2xxs_q2k 模式启用 GPU FFN（量化格式直传GPU，二次触发准入+异步预取）")
+    parser.add_argument("--gpu-cache-cap", type=int, default=0,
+                        help="GPU FFN 缓存容量（专家数，0=自动计算）")
+    parser.add_argument("--prefetch-count", type=int, default=50,
+                        help="每层预测性预取的最大专家数（默认50）")
+    parser.add_argument("--prefetch-layers", type=int, default=1,
+                        help="向前预取的层数 1-6（默认1，仅L+1）")
     args = parser.parse_args()
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
     main(args.ckpt_path, args.config, args.input_file, args.interactive,
          args.max_new_tokens, args.temperature, args.quant_type, args.iq2xs_dir,
-         args.repetition_penalty, args.top_p, args.min_p, args.gguf_path)
+         args.repetition_penalty, args.top_p, args.min_p, args.gguf_path,
+         args.gpu_ffn, args.gpu_cache_cap, args.prefetch_count, args.prefetch_layers)

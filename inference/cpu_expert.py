@@ -806,6 +806,20 @@ class CpuExpertRunner:
 
         # IQ2_XXS+Q2_K 混合量化路径
         if self._mixed_pool is not None:
+            # GPU FFN 路径：热专家在 GPU 上
+            if self._mixed_pool._gpu_ffn and self._mixed_pool.gpu_cache_contains(layer_id, expert_id):
+                try:
+                    x_bf16 = x_gpu.unsqueeze(0) if x_gpu.dim() == 1 else x_gpu  # [1, K]
+                    gpu_out = self._mixed_pool.compute_ffn_gpu(layer_id, expert_id, x_bf16, route_weight)
+                    if gpu_out is not None:
+                        self._gpu_ffn_hit = getattr(self, '_gpu_ffn_hit', 0) + 1
+                        self._mixed_pool.record_gpu_ffn_hit()
+                        return gpu_out.squeeze(0) if gpu_out.shape[0] == 1 else gpu_out
+                except Exception as e:
+                    print(f"[MixedFFN GPU] Error: {e}")
+
+            # CPU FFN 回退路径
+            self._mixed_pool.record_gpu_ffn_miss()
             x_cpu = x_gpu.float().cpu().numpy()
             try:
                 output = self._mixed_pool.compute_ffn(layer_id, expert_id, x_cpu, route_weight, swiglu_limit)

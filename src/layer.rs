@@ -25,6 +25,19 @@ fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
+/// 简单 f32 矩阵向量乘法（CPU 标量回退）
+fn matvec_f32(weight: &[f32], x: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; out_dim];
+    for row in 0..out_dim {
+        let mut sum = 0.0f32;
+        for col in 0..in_dim {
+            sum += weight[row * in_dim + col] * x[col];
+        }
+        out[row] = sum;
+    }
+    out
+}
+
 fn log_vram(device: &Arc<CudaContext>, label: &str) {
     unsafe {
         let mut free: usize = 0;
@@ -1008,6 +1021,58 @@ impl TransformerLayer {
         let inter_dim = self.config.moe_intermediate_size;
         let device = x.device.clone();
 
+        // 阶段1: GPU 缓存命中 → 直接 GPU GEMM（~0.2ms）
+        // 只检查 GPU 缓存，不上传
+        if self.expert_scheduler.gpu_cache_contains(self.layer_id, expert_id) {
+            if let Ok(gpu_weights) = self.expert_scheduler.get_expert_gpu(self.layer_id, expert_id, true) {
+                let m = x.shape.iter().rev().skip(1).product::<usize>();
+                let x_flat = GpuTensor {
+                    slice: x.slice.clone(),
+                    shape: vec![m, dim],
+                    dtype: x.dtype,
+                    device: device.clone(),
+                };
+
+                let result = if self.expert_scheduler.expert_dtype == DType::FP4E2M1 {
+                    let gate = self.fp4_gemm_act_quant(&x_flat, &gpu_weights.w1, &gpu_weights.w1_scale, inter_dim)?;
+                    let up = self.fp4_gemm_act_quant(&x_flat, &gpu_weights.w3, &gpu_weights.w3_scale, inter_dim)?;
+                    let swiglu_out = self.swiglu(&gate, &up)?;
+                    let swiglu_flat = GpuTensor {
+                        slice: swiglu_out.slice.clone(),
+                        shape: vec![m, inter_dim],
+                        dtype: swiglu_out.dtype,
+                        device: device.clone(),
+                    };
+                    self.fp4_gemm_act_quant(&swiglu_flat, &gpu_weights.w2, &gpu_weights.w2_scale, dim)?
+                } else {
+                    let gate = self.fp8_gemm_act_quant(&x_flat, &gpu_weights.w1, &gpu_weights.w1_scale, inter_dim)?;
+                    let up = self.fp8_gemm_act_quant(&x_flat, &gpu_weights.w3, &gpu_weights.w3_scale, inter_dim)?;
+                    let swiglu_out = self.swiglu(&gate, &up)?;
+                    let swiglu_flat = GpuTensor {
+                        slice: swiglu_out.slice.clone(),
+                        shape: vec![m, inter_dim],
+                        dtype: swiglu_out.dtype,
+                        device: device.clone(),
+                    };
+                    self.fp8_gemm_act_quant(&swiglu_flat, &gpu_weights.w2, &gpu_weights.w2_scale, dim)?
+                };
+
+                return Ok(result);
+            }
+        }
+
+        // 阶段2: GPU 缓存未命中 → CPU FFN（~2.7ms，比 DMA 5ms 快）
+        // 首先尝试上传到 GPU 并计算（回退到原始路径，保证正确性）
+        // TODO: 后续替换为纯 CPU FFN 路径
+        self.compute_expert_gpu_upload(x, expert_id)
+    }
+
+    /// 原始路径：上传到 GPU 并计算
+    fn compute_expert_gpu_upload(&mut self, x: &GpuTensor, expert_id: usize) -> Result<GpuTensor> {
+        let dim = self.config.hidden_size;
+        let inter_dim = self.config.moe_intermediate_size;
+        let device = x.device.clone();
+
         self.expert_scheduler.ensure_expert_loaded(self.layer_id, expert_id, &mut self.weight_loader)?;
 
         let m = x.shape.iter().rev().skip(1).product::<usize>();
@@ -1048,6 +1113,128 @@ impl TransformerLayer {
         drop(x_flat);
 
         result
+    }
+
+    /// CPU FFN 回退：从 CPU 缓存/SSD 加载权重，在 CPU 上计算 FFN
+    fn compute_expert_cpu(&mut self, x: &GpuTensor, expert_id: usize) -> Result<GpuTensor> {
+        let dim = self.config.hidden_size;
+        let inter_dim = self.config.moe_intermediate_size;
+        let device = x.device.clone();
+
+        // 确保 CPU 缓存中有权重
+        self.expert_scheduler.ensure_expert_loaded(self.layer_id, expert_id, &mut self.weight_loader)?;
+
+        // 从 GPU 下载 x 到 CPU
+        let x_host = x.to_host()?;
+        let x_bf16: &[half::bf16] = bytemuck::cast_slice(&x_host.data);
+        let m = x.shape.iter().rev().skip(1).product::<usize>();
+        let mut x_f32 = vec![0.0f32; m * dim];
+        for (i, v) in x_bf16.iter().enumerate() {
+            x_f32[i] = v.to_f32();
+        }
+
+        // 获取 CPU 缓存中的权重并执行 CPU FFN
+        let result_f32 = if self.expert_scheduler.expert_dtype == DType::FP4E2M1 {
+            self.cpu_ffn_fp4(&x_f32, expert_id, m, dim, inter_dim)?
+        } else {
+            // FP8: 反量化到 f32 后用标量 FFN
+            self.cpu_ffn_fp8(&x_f32, expert_id, m, dim, inter_dim)?
+        };
+
+        // 结果上传回 GPU
+        let result_bf16: Vec<u16> = result_f32.iter()
+            .map(|v| half::bf16::from_f32(*v).to_bits())
+            .collect();
+        let result_cpu = CpuTensor::new(
+            bytemuck::cast_slice(&result_bf16).to_vec(),
+            vec![m, dim],
+            DType::BF16,
+        );
+        GpuTensor::from_host(device, &result_cpu)
+    }
+
+    /// FP4 CPU FFN：使用 AVX-512 优化的 cpu_expert 模块
+    fn cpu_ffn_fp4(
+        &mut self,
+        x: &[f32],
+        expert_id: usize,
+        m: usize,
+        dim: usize,
+        inter_dim: usize,
+    ) -> Result<Vec<f32>> {
+        use crate::cpu_expert::kernel::{Fp4Weight, fp4_expert_ffn_pair_amd7600};
+
+        let cpu_weights = self.expert_scheduler.get_cpu_weights(self.layer_id, expert_id)
+            .ok_or_else(|| anyhow!("expert {}/{} not in CPU cache", self.layer_id, expert_id))?;
+
+        // safetensors 中 FP4 权重 shape=[out_dim, in_dim/2]（packed），scale shape=[out_dim, in_dim/32]
+        // Fp4Weight 期望逻辑 shape=(out_dim, in_dim)
+        let gate_w = Fp4Weight::new(
+            cpu_weights.w1.data.clone(),
+            cpu_weights.w1_scale.data.clone(),
+            (inter_dim, dim),
+        );
+        let up_w = Fp4Weight::new(
+            cpu_weights.w3.data.clone(),
+            cpu_weights.w3_scale.data.clone(),
+            (inter_dim, dim),
+        );
+        let down_w = Fp4Weight::new(
+            cpu_weights.w2.data.clone(),
+            cpu_weights.w2_scale.data.clone(),
+            (dim, inter_dim),
+        );
+
+        // 逐 token 调用 CPU FFN
+        let mut result = vec![0.0f32; m * dim];
+        for t in 0..m {
+            let x_t = &x[t * dim..(t + 1) * dim];
+            let out_t = fp4_expert_ffn_pair_amd7600(x_t, &gate_w, &up_w, &down_w, 1.0, 0.0);
+            result[t * dim..(t + 1) * dim].copy_from_slice(&out_t);
+        }
+
+        Ok(result)
+    }
+
+    /// FP8 CPU FFN：反量化到 f32 后标量计算
+    fn cpu_ffn_fp8(
+        &mut self,
+        x: &[f32],
+        expert_id: usize,
+        _m: usize,
+        dim: usize,
+        inter_dim: usize,
+    ) -> Result<Vec<f32>> {
+        let cpu_weights = self.expert_scheduler.get_cpu_weights(self.layer_id, expert_id)
+            .ok_or_else(|| anyhow!("expert {}/{} not in CPU cache", self.layer_id, expert_id))?;
+
+        // 反量化 FP8 权重到 f32
+        let w1_f32 = quant::dequant_fp8_e4m3_to_f32(&cpu_weights.w1.data, &cpu_weights.w1_scale.data, &cpu_weights.w1.shape)?;
+        let w3_f32 = quant::dequant_fp8_e4m3_to_f32(&cpu_weights.w3.data, &cpu_weights.w3_scale.data, &cpu_weights.w3.shape)?;
+        let w2_f32 = quant::dequant_fp8_e4m3_to_f32(&cpu_weights.w2.data, &cpu_weights.w2_scale.data, &cpu_weights.w2.shape)?;
+
+        // 标量 matvec
+        let mut result = Vec::new();
+        for t in 0..x.len() / dim {
+            let x_t = &x[t * dim..(t + 1) * dim];
+            // gate
+            let gate = matvec_f32(&w1_f32, x_t, inter_dim, dim);
+            // up
+            let up = matvec_f32(&w3_f32, x_t, inter_dim, dim);
+            // SwiGLU
+            let mut mid = vec![0.0f32; inter_dim];
+            for i in 0..inter_dim {
+                let g = gate[i];
+                let u = up[i];
+                let sig = 1.0 / (1.0 + (-g).exp());
+                mid[i] = g * sig * u;
+            }
+            // down
+            let out = matvec_f32(&w2_f32, &mid, dim, inter_dim);
+            result.extend_from_slice(&out);
+        }
+
+        Ok(result)
     }
 
     fn act_quant_inplace_nope(&self, kv: &GpuTensor) -> Result<GpuTensor> {

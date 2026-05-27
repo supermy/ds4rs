@@ -1,0 +1,17 @@
+DeepSeek V4 is a large language model developed by DeepSeek AI. It features a Mixture of Experts architecture with 256 routed experts per layer and 1 shared expert. The model uses a novel attention mechanism called Multi-Head Latent Attention (MLA) which compresses key-value cache for efficient inference.
+
+The model architecture includes:
+- 43 transformer layers
+- 256 routed experts per layer with top-6 routing
+- 1 shared expert always active
+- Multi-Head Latent Attention with KV cache compression
+- SwiGLU activation in the expert FFN
+
+For quantization, we use importance weights derived from calibration data to guide the quantization process. This helps maintain model quality while reducing memory footprint.
+
+The inference engine supports both GPU and CPU computation, with a three-tier caching system for expert weights:
+- L1: GPU VRAM for hot experts
+- L2: CPU RAM with pinned memory
+- L3: SSD archive with memory mapping
+
+This hybrid approach enables efficient inference on resource-constrained hardware while maintaining high throughput.

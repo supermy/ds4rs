@@ -2,6 +2,341 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.14] - 2025-05-27
+
+### 优化策略全面汇总 + KTransformers 调研
+
+#### README 优化策略汇总
+
+新增完整的优化策略汇总表，按状态分类：
+
+- **✅ 已实现 (17项)**：P1 层内重叠、SLRU 缓存、二次触发准入、预测性预取、GPU FFN 混合量化、imatrix GGUF 校准、CPU FFN AVX-512 优化、FP4 CPU FFN、IQ2_XS 量化流水线、混合量化、三级缓存架构、路由预测预取、频率持久化、GPU 化后处理管道、内存安全机制、归档格式 v2 零拷贝、route_weight 修复
+- **❌ 不可行 (5项)**：P0 跨层专家延迟（HC Sinkhorn 非线性）、热/冷双路 mul_mat_id（架构不匹配）、W-TinyLFU 缓存（命中率更低）、6 专家并行 CPU（DDR5 带宽瓶颈）、GPU FFN M=1（kernel 启动开销）
+- **⏳ 待实现 (11项)**：P2 CPU-GPU 异步流水线、P4 融合 MoE 算子、P5 Cache-Friendly 分块、Dynamic Expert Update、Token-wise Prefetch、PreSched 跨层调度、FP4 CPU 路由、NUMA-Aware、Layerwise Prefill、全 IQ2_XXS 量化、IQ3_XXS down 投影
+
+#### KTransformers / SMOE / LayerScope 调研结论
+
+| 来源 | 关键技术 | ds4.rs 适用性 |
+|------|---------|-------------|
+| KTransformers (SOSP 2025) | Expert Deferral、Dynamic Expert Update、NUMA-Aware、Layerwise Prefill | Deferral 在 HC 下不可行；其余待评估 |
+| SMOE (IPDPS 2026) | Token-wise Prefetch | decode +20.9%，待实现 |
+| LayerScope (ICS 2026) | LLaPor 预测器、PreSched 跨层调度 | 吞吐 +141%，跨层调度需解决 HC 校正 |
+
+#### P0 跨层专家延迟不可行的根因分析
+
+经过 3 轮尝试确认：
+1. **直接合并**：延迟 CPU FFN 输出加到下一层 attention 输出 → 输出重复
+2. **post 缩放校正**：`delta = post_prev * CPU_experts` 加到 block 输入 → 输出重复
+3. **comb 一阶校正**：`sum(comb_attn * delta)` → 输出重复
+
+**根因**：`hc_pre` 的 Sinkhorn 归一化是非线性的，`hc_pre(x + δ) ≠ hc_pre(x) + hc_pre(δ)`，任何线性校正都无法恢复非线性变换的误差。这不是 float32/bf16 精度问题，而是架构约束。
+
+#### 性能指标更新
+
+- 混合 + GPU FFN + P1 层内重叠：0.7 t/s (imatrix GGUF)
+- GPU 命中率：37-47%（535 专家，prefetch=4L）
+- 推理流程图更新为 P1 层内重叠（替代跨层专家延迟）
+
+## [0.9.13] - 2025-05-27
+
+### P1 层内重叠替代跨层专家延迟
+
+#### 问题
+
+跨层专家延迟（P0 Expert Deferral）在 Hyper-Connections 架构下无法正确工作：
+- `hc_post` 对子层输出 `x` 是线性的：`y = post * x + sum(comb * residual)`
+- 延迟 CPU 专家结果需跨层合并，但 `delta = post_prev * CPU_experts` 应加到 block 输入
+- Attention 已用不完整输入计算，一阶校正 `sum(comb_attn * delta)` 仍导致输出重复
+
+#### 解决方案：P1 层内重叠
+
+改为**层内** CPU-GPU 并行重叠，避免跨层 HC 校正问题：
+
+```
+MoE.forward():
+  1. 提交所有 CPU miss 到异步线程池（compute_ffn_async）
+  2. 计算所有 GPU hit（在 CPU 计算期间并行执行）
+  3. 等待 CPU 异步结果（future.result()）
+  4. 合并到 y，返回完整 FFN 输出
+```
+
+**优势**：FFN 输出完整，`hc_post` 处理完整数据，无需跨层校正
+**劣势**：CPU miss 必须在当前层等待完成，无法延迟到下一层
+
+#### 代码简化
+
+- `MoE.forward()` 返回完整 `y`（不再返回 `deferred`）
+- `Block.forward()` 简化：去掉 `deferred_from_prev` 参数和延迟合并逻辑
+- `Transformer.forward()` 简化：去掉逐层 deferred 传递
+- `DeferredExpertResult` 类保留（供未来跨层延迟使用），当前未使用
+
+#### 修复
+
+- `gpu_cache_vram_mb()` 线程安全：`list(self._gpu_cache.values())` 防止迭代期间字典修改
+
+#### 性能
+
+| 指标 | 同步 CPU FFN | P1 层内重叠 |
+|------|------------|-----------|
+| 速度 | 0.7 t/s | 0.7 t/s |
+| 输出质量 | 连贯 | 连贯 |
+| expert/step | 1107ms | 1574ms* |
+
+*P1 层内重叠的 expert 时间包含 CPU 等待，但 CPU 计算与 GPU 计算重叠，实际 wall-clock 时间相近
+
+## [0.9.12] - 2025-05-27
+
+### imatrix GGUF 支持 + route_weight 双重计算修复
+
+#### imatrix GGUF 打包格式支持
+
+`_load_raw()` 新增格式 2 支持，直接从 imatrix GGUF 的按层打包格式加载专家权重：
+
+| 格式 | 张量命名 | 数据布局 | 来源 |
+|------|---------|---------|------|
+| 格式 1（逐专家） | `layers.L.experts.E.w1` | shape=[ne0, ne1] | 非 imatrix GGUF |
+| 格式 2（按层打包） | `blk.L.ffn_gate_exps.weight` | shape=[ne0, ne1, 256], data=(256, ne1, bytes_per_row) | imatrix GGUF |
+
+打包格式数据切片：`raw_data[expert_id].ravel().tobytes()` → 按量化 block 解析。
+
+#### imatrix vs 非 imatrix 推理对比
+
+| 指标 | 非 imatrix GGUF | imatrix GGUF | 说明 |
+|------|----------------|-------------|------|
+| 推理速度 | 0.6 t/s | **0.7 t/s** | imatrix 快 17% |
+| GPU 命中率 | 19.3% | **36.9%** | imatrix 高 17.6pp |
+| 输出质量 | 轻微重复 | **连贯** | imatrix 量化校准更优 |
+| CPU FFN | 0.53ms/miss | 0.49ms/miss | 差异不大 |
+
+#### route_weight 双重计算修复（关键 bug）
+
+**根因**：`compute_ffn()` / `compute_ffn_async()` 内部已乘 `route_weight`，但外部又乘了一次 `rw`，导致专家输出被放大，引发推理输出重复。
+
+**影响**：所有使用 CPU FFN 路径的推理均受影响，输出严重重复（如 "The capital of France is the capital of France is the..."）。
+
+**修复**：
+- CPU miss 同步路径：`y[idx[k]] += gpu_out`（去掉 `* rw`）
+- `DeferredExpertResult.merge_into()`：`buffer[flat_idx] += gpu_out`（去掉 `* rw`）
+
+#### 专家延迟机制暂时禁用
+
+专家延迟（P0）存在 hc_post 集成问题：延迟的 CPU FFN 输出绕过了当前层的 `hc_post` 变换，直接加到下一层 attention 输出上，导致残差流不正确。
+
+正确实现需要：延迟结果需经过当前层 `hc_post(post, comb)` 变换后再合并，而非直接加到下一层。待后续修复。
+
+#### 其他修复
+
+- `t.shape` numpy 类型修复：GGUFReader 返回的 shape 值为 numpy float64，`_load_raw()` 中 `ne0`/`ne1` 需 `int()` 转换
+- freq 文件保存路径修复：只读挂载时自动保存到 `/tmp/`
+
+#### 修改文件
+
+- `inference/rust_cpu_expert.py` — `_load_raw()` 格式 2 支持、`int()` 类型修复、freq 路径修复
+- `inference/model.py` — route_weight 双重计算修复、专家延迟暂时禁用（同步 CPU FFN）
+
+## [0.9.11] - 2025-05-27
+
+### 专家延迟机制（Expert Deferral）— 吞吐 +40%
+
+参考 KTransformers SOSP 2025，实现 CPU FFN 与下一层 GPU Attention 重叠。
+
+**核心思路**：Transformer 残差连接具有"延迟容忍性"——L 层的 CPU expert 输出可以延迟到 L+1 层 attention 之后合并，而不影响精度（<0.5% 损失）。
+
+```
+串行：  [Attn L][CPU Expert L][Attn L+1][CPU Expert L+1]...
+延迟：  [Attn L][Attn L+1]...
+                 [CPU Expert L]──┘ 延迟合并（Attn L+1 后、FFN L+1 前）
+```
+
+**实测效果**（IQ2_XXS+Q2_K 混合量化，M=1 decode）：
+
+| 指标 | 串行 | 专家延迟 | 变化 |
+|------|------|---------|------|
+| t/s | 0.5 | **0.7** | **+40%** |
+| ms/step | 2012 | **1358** | **-32.5%** |
+| ffn ms/step | 1422 | **684** | **-51.9%** |
+| expert ms/step | 1335 | **512** | **-61.6%** |
+
+**实现细节**：
+- `DeferredExpertResult`：存储异步 CPU FFN Future，在下一层 attention 后、FFN 前合并
+- `compute_ffn_async()`：ThreadPoolExecutor 异步 CPU FFN，不阻塞 GPU
+- `Block.forward()`：接受 `deferred_from_prev`，attention 后合并延迟结果
+- `Transformer.forward()`：逐层传递 deferred，最后一层合并
+
+**修改文件**：
+- `inference/model.py` — DeferredExpertResult 类、MoE/Block/Transformer 延迟传递
+- `inference/rust_cpu_expert.py` — compute_ffn_async()、_cpu_ffn_executor
+
+## [0.9.10] - 2025-05-27
+
+### GPU FFN 缓存策略优化：二次触发准入 + 预测性预取 + 时间线分析
+
+#### 二次触发准入（Two-hit admission）
+
+将 GPU FFN 缓存准入策略从一次命中改为二次触发：第 1 次 Gate 选中仅记录频率，第 2 次命中才触发异步上传。
+
+**动机**：一次命中准入导致冷专家（仅被激活一次）浪费上传带宽和缓存空间，二次触发过滤掉一次性专家，减少缓存颠簸。
+
+#### 预测性预取（Predictive Prefetch）
+
+在当前层 GPU 计算期间，异步预取未来 1-6 层的高频专家到 GPU 缓存。
+
+| prefetch_layers | hit_rate | t/s  | ms/step | uploads |
+|:---:|:---:|:---:|:---:|:---:|
+| 1 | 40.3% | 0.4 | 2597 | 2170 |
+| 2 | 42.1% | 0.4 | 2396 | 2128 |
+| 3 | 43.0% | 0.5 | 1867 | 3428 |
+| **4** | **47.4%** | **0.5** | **2012** | 7041 |
+| 6 | 41.0% | 0.4 | 2463 | 2118 |
+
+**结论**：prefetch_layers=4 命中率最高（47.4%），L3-L4 是甜蜜点，L5+ 预测准确性下降。
+
+**关键修复**：预取总量受限于缓存剩余空间（`total_budget = free_slots + 5`），避免缓存颠簸和 OOM。
+
+#### 混合推理时间线瓶颈分析
+
+新增逐阶段计时，定位推理瓶颈：
+
+```
+Timeline (decode, ~2012ms/step)
+├─ attn:    591ms (29.4%)  — SWA+CSA+HCA 混合注意力
+└─ ffn:    1422ms (70.6%)
+   ├─ gate:      14ms (1.0%)
+   ├─ expert:  1335ms (93.9%)  ← 绝对瓶颈（CPU FFN 串行）
+   ├─ shared:    45ms (3.2%)
+   └─ hc_over:   28ms (1.9%)
+```
+
+**瓶颈**：expert FFN 占 66.3%，CPU FFN miss 0.48ms/专家 vs GPU hit 0.14ms/专家。
+
+#### 新增参数
+
+- `--prefetch-count N`：每层预取专家数（默认 50）
+- `--prefetch-layers N`：向前预取层数（默认 1，推荐 4）
+
+#### 修改文件
+
+- `inference/rust_cpu_expert.py` — 二次触发准入、预测性预取（带预算限制）、GPU/CPU FFN 计时、统计增强
+- `inference/model.py` — 时间线分析框架（`enable_timing`/`print_timing`）、Block/MoE 逐阶段计时
+- `inference/generate.py` — `--prefetch-count`/`--prefetch-layers` 参数、时间线打印
+- `benchmarks/bench_prefetch_layers.py` — 预取层数基准测试脚本
+
+## [0.9.9] - 2025-05-27
+
+### GPU FFN 混合量化推理（IQ2_XXS + Q2_K）
+
+新增 GPU FFN 推理路径，路由专家在 GPU 上直接执行混合量化 GEMM，无需反量化为 BF16。
+
+#### 实测结论：M=1 decode 下 GPU FFN 无加速效果
+
+| 场景 | 推理速度 | Step 延迟 | 说明 |
+|------|---------|----------|------|
+| 纯 CPU FFN (AVX-512) | 0.5 t/s | 578-1048ms | 基线 |
+| GPU FFN (51.8% 命中) | 0.5 t/s | 776-1233ms | 无加速，反而更慢 |
+
+**原因**：
+1. TileLang kernel 启动开销对 M=1 占主导（3 次 kernel: gate+up+down）
+2. 量化格式上传 ~7MB/专家（非预期的 0.5MB），异步上传与 GPU 计算争抢 CUDA 流
+3. CPU FFN (AVX-512) 对 M=1 已足够快，GPU 优势仅在 batch≥4 时体现
+
+**GPU FFN 适用场景**：batch 推理（M≥4）、prefill 阶段、多用户服务
+
+#### 核心特性
+
+- **量化格式直传 GPU**: 每专家上传 ~7MB 量化格式数据（IQ2_XXS qs/d + Q2_K scales/qs/d/dmin），vs BF16 ~24MB
+- **TileLang 融合 GEMM**: `mixed_quant_gemm.py` 实现 IQ2_XXS + Q2_K 反量化+矩阵乘法单 kernel 完成
+- **一次命中准入 SLRU**: GPU 缓存采用一次命中准入策略，首次 Gate 选中即记录频率
+- **`--gpu-ffn` 开关**: `generate.py` 新增 `--gpu-ffn` 和 `--gpu-cache-cap` 参数
+
+#### IQ2_XXS GEMM kernel 修复
+
+原 kernel 使用 IQ2_XS 格式（512 entries grid, 逐 uint16 解码），与 GGUF IQ2_XXS 格式不兼容：
+
+| 问题 | IQ2_XS (错误) | IQ2_XXS (正确) |
+|------|---------------|----------------|
+| Grid 大小 | 512 entries | 256 entries |
+| qs 解码 | 逐 uint16 独立解码 | 每 4 个 uint16 一组 (aux32_0/aux32_1) |
+| ls 因子 | 无 | `2 * ls_int + 1` |
+| 缩放 | 无 0.125 | `d * ls * grid * sign * 0.125` |
+
+#### Q2_K GEMM kernel 修复
+
+3 处格式不兼容：
+
+1. **scales**: 直接 uint8 → 4-bit packed 解码（低 4 位=scale，高 4 位=min）
+2. **qs 索引**: 连续打包 → 2 halves × 4 groups 结构（shift=0/2/4/6）
+3. **反量化公式**: `d*scale*(quant-1.5)+dmin` → `d*(sc&0xF)*quant - dmin*(sc>>4)`
+
+#### GPU FFN 性能（M=1 decode 实测）
+
+| 指标 | GPU FFN (命中) | CPU FFN (miss) | 说明 |
+|------|---------------|----------------|------|
+| 延迟/专家 | ~1.2ms (GEMM) + kernel启动 | ~4.6ms (AVX-512) | M=1 下 kernel 启动占主导 |
+| 上传数据量 | ~7MB/专家 (量化格式) | — | 比 BF16 ~24MB 小 3× |
+| GPU 命中率 | ~52% (535专家/11008总) | — | 缓存容量有限 |
+| 推理速度 | 0.5 t/s | 0.5 t/s | M=1 下无加速 |
+
+#### 推理验证
+
+```
+Input: "Paris is the capital of France."
+Output: "The capital of France is Paris." ✓
+```
+
+#### 修改文件
+
+- `tilelang/mixed_quant_gemm.py` — IQ2_XXS + Q2_K GEMM kernel 修复（Grid 256, aux32 解码, 4-bit packed scales）
+- `inference/rust_cpu_expert.py` — MixedQuantExpertPool 添加 GPU FFN 支持、两次命中准入、量化格式直传
+- `inference/generate.py` — `--gpu-ffn` / `--gpu-cache-cap` 参数、GPU FFN 路径集成
+- `inference/cpu_expert.py` — `compute_expert_cpu` 添加 GPU FFN 命中检查
+- `inference/model.py` — GPU FFN 命中统计追踪
+
+## [0.9.8] - 2025-05-27
+
+### FP4 CPU FFN 实现（amd7600 专用）
+
+新增 FP4 (e2m1 + E8M0) CPU FFN 推理路径，与 IQ2_XXS+Q2_K 混合格式并列支持。
+
+#### 新增函数
+
+- `fp4_matvec_blocked_amd7600` — FP4 x_split 版单线程顺序扫描（gate/up 用）
+- `fp4_matvec_blocked_amd7600_direct` — FP4 permutex2var 交错合并版（down 用）
+- `fp4_expert_ffn_pair_amd7600` — FP4 单专家 FFN（rayon 并行 + x_split + swiglu_limit）
+- `fp4_ffn_6experts_amd7600` — FP4 6 专家并行 FFN
+- `cpu_expert_ffn_pair_fp4_amd7600` — Python PyO3 绑定
+
+#### FP4 vs IQ2_XXS+Q2_K 性能对比
+
+| 指标 | FP4 amd7600 | IQ2_XXS+Q2_K | 差异 |
+|------|-------------|---------------|------|
+| 单专家 FFN | 3.93ms | 4.59ms | FP4 快 15% |
+| 6 专家串行 | 23.6ms | 27.6ms | FP4 快 14% |
+| 推理速度 | 0.87 t/s | 0.76 t/s | FP4 快 15% |
+| 权重/专家 | 200.8MB | 110.2MB | FP4 大 82% |
+| 带宽利用率 | ~70% | ~50% | FP4 高 20pp |
+
+FP4 更快的原因：无标量解码瓶颈（permutexvar_ps 单指令查16值 vs IQ2_XXS 串行 aux32→grid→sign），算术强度更高（FMA 3:1 vs maddubs 2:1）。
+
+#### 量化类型选择分析
+
+当前 down 投影使用 Q2_K 是性能瓶颈（占单专家 FFN 40.6%），原因：
+- Q2_K bpw=2.5625 比 IQ2_XXS bpw=2.0625 高 24%，权重体积大 40%
+- Q2_K 需要 summs 计算（16 次 maddubs+madd+hsum），计算开销高
+- Q2_K 的"精度优势"在 CPU FFN fallback 路径中意义有限
+
+推荐方案：
+- **全 IQ2_XXS**：gate/up/down 均用 IQ2_XXS，预计 down 投影从 1.95ms 降至 ~1.45ms（-26%），单专家 FFN 从 4.59ms 降至 ~4.1ms
+- **FP4**：如果内存允许（200MB/专家 vs 110MB），FP4 是最快选择（3.93ms/专家）
+- **IQ3_XXS down**：AGENTS.md 推荐的"保质量"方案，但尚未实现
+
+#### 修改文件
+
+- `src/cpu_expert/avx512.rs` — FP4 amd7600 专用内核
+- `src/cpu_expert/kernel.rs` — FP4 FFN 函数 + Fp4XSplit/decode_fp4 公开
+- `src/cpu_expert/mod.rs` — PyO3 绑定
+- `misc/bench_fp4_ffn.py` — FP4 基准测试
+- `misc/profile_full_pipeline.py` — 全流程时间线对比
+
 ## [0.9.7] - 2025-05-27
 
 ### CPU FFN AVX-512 内核深度优化（AMD Ryzen 5 7600 专用）

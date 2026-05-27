@@ -12,6 +12,196 @@ import torch.distributed as dist
 from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn
 from iq2xs_gemm_tilelang import iq2xs_gemm_optimized
 
+# ============================================================================
+# 时间线分析：逐阶段计时，用于混合推理瓶颈定位
+# ============================================================================
+import time as _time
+
+_TIMING = {}       # {key: cumulative_seconds}
+_TIMING_ENABLED = False
+
+def enable_timing():
+    """启用时间线分析。"""
+    global _TIMING_ENABLED
+    _TIMING_ENABLED = True
+    _TIMING.clear()
+
+def disable_timing():
+    """禁用时间线分析。"""
+    global _TIMING_ENABLED
+    _TIMING_ENABLED = False
+
+def get_timing():
+    return dict(_TIMING)
+
+def reset_timing():
+    _TIMING.clear()
+
+def print_timing(n_steps: int = 0):
+    """打印时间线分析结果：高层 attn vs ffn + MoE 逐阶段明细。"""
+    if not _TIMING:
+        print("[Timeline] No timing data")
+        return
+    # 按阶段汇总（跨层累加）
+    stages = {}
+    for key, val in _TIMING.items():
+        parts = key.split('_', 1)
+        stage = parts[1] if len(parts) == 2 and parts[0].startswith('L') else key
+        stages[stage] = stages.get(stage, 0.0) + val
+
+    steps = n_steps or max(1, int(stages.get('steps', 1)))
+
+    # 高层：attn + ffn（ffn 已包含 gate+expert+shared，不重复计算）
+    high_level = {k: v for k, v in stages.items() if k in ('attn', 'ffn')}
+    total = sum(high_level.values())
+    if total == 0:
+        total = sum(v for k, v in stages.items() if k != 'steps')
+
+    # MoE 明细：gate + expert + shared
+    moe_total = stages.get('gate', 0) + stages.get('expert', 0) + stages.get('shared', 0)
+    hc_overhead = stages.get('ffn', 0) - moe_total
+
+    print(f"\n{'='*70}")
+    print(f"  Timeline ({steps} steps, total={total:.3f}s, {total/steps*1000:.1f}ms/step)")
+    print(f"{'='*70}")
+    print(f"  {'Stage':30s} {'ms/step':>10s} {'%':>6s}")
+    print(f"  {'-'*30} {'-'*10} {'-'*6}")
+    for stage in ('attn', 'ffn'):
+        if stage in high_level:
+            val = high_level[stage]
+            pct = val / total * 100 if total > 0 else 0
+            print(f"  {stage:30s} {val/steps*1000:10.1f} {pct:6.1f}")
+    print(f"  {'-'*30} {'-'*10} {'-'*6}")
+    print(f"  {'TOTAL':30s} {total/steps*1000:10.1f} {100.0:6.1f}")
+    print(f"{'='*70}")
+
+    # MoE 明细
+    if moe_total > 0:
+        ffn_val = stages.get('ffn', 0)
+        print(f"\n  MoE Breakdown (ffn={ffn_val/steps*1000:.1f}ms/step):")
+        for stage in ('gate', 'expert', 'shared'):
+            val = stages.get(stage, 0)
+            pct_of_ffn = val / ffn_val * 100 if ffn_val > 0 else 0
+            print(f"    {stage:28s} {val/steps*1000:8.1f}ms  ({pct_of_ffn:5.1f}% of ffn)")
+        if hc_overhead > 0:
+            pct_of_ffn = hc_overhead / ffn_val * 100 if ffn_val > 0 else 0
+            print(f"    {'hc_overhead':28s} {hc_overhead/steps*1000:8.1f}ms  ({pct_of_ffn:5.1f}% of ffn)")
+        print(f"{'='*70}")
+
+
+# ============================================================================
+# 专家延迟机制（Expert Deferral）
+# 参考 KTransformers SOSP 2025：CPU FFN 与下一层 GPU Attention 重叠
+# 延迟合并残差连接，精度损失 <0.5%
+# ============================================================================
+
+class DeferredExpertResult:
+    """延迟 CPU 专家计算结果，在下一层 FFN 前合并。
+
+    时间线：
+      GPU: [Attn L][GPU Expert L][Attn L+1]...
+      CPU:           [CPU Expert L]──┘ 延迟合并（在 Attn L+1 后、FFN L+1 前）
+
+    合并时机：Block L+1 的 attention 子层完成后、FFN 子层前。
+
+    HC 线性校正：
+      hc_post 对子层输出 x 是线性的：y = post * x + sum(comb * residual)
+      因此延迟 CPU 专家的校正项 = post.unsqueeze(-1) * cpu_sum.unsqueeze(-2)
+      其中 post 来自当前层 FFN 子层的 hc_pre，cpu_sum 是延迟 CPU 专家输出之和。
+    """
+
+    def __init__(self):
+        self._pending = []  # (future, flat_idx, route_weight, device, dtype)
+        self._post = None   # hc_post 的 post 权重 [b, s, hc_mult]
+        self._hc_mult = 1
+
+    def add(self, future, flat_idx: int, route_weight: float, device, dtype):
+        """添加一个延迟 CPU FFN 计算任务。"""
+        self._pending.append((future, flat_idx, route_weight, device, dtype))
+
+    def set_hc_post(self, post: torch.Tensor, hc_mult: int):
+        """设置 hc_post 的 post 权重，用于延迟合并时的线性校正。
+
+        Args:
+            post: [b, s, hc_mult] 来自 FFN 子层 hc_pre 的后处理权重
+            hc_mult: HC 副本数
+        """
+        self._post = post.detach()
+        self._hc_mult = hc_mult
+
+    @property
+    def is_empty(self) -> bool:
+        return len(self._pending) == 0
+
+    def merge_into(self, x: torch.Tensor, dim: int, comb: torch.Tensor = None) -> torch.Tensor:
+        """将延迟结果合并到 x 中，应用 hc_post 线性校正。
+
+        合并逻辑：
+          1. 等待所有 CPU FFN 完成，累加到 buffer [flat_size, dim]
+          2. 计算 delta = post_flat * buffer（CPU 专家对 block 输出的贡献）
+          3. 如果有 comb（当前层 attention 的 comb），应用一阶校正：
+             correction = sum(comb * delta, dim=hc_src)
+             这是因为 delta 应加到 block 输入（当前层输入），
+             但 attention 已用不完整输入计算，需通过 comb 变换校正
+          4. 将校正加到 x
+
+        Args:
+            x: [bsz, seqlen, hc_mult, dim] 的残差张量
+            dim: 隐藏维度大小
+            comb: [bsz, seqlen, hc_mult, hc_mult] 当前层 attention 的 comb 权重
+
+        Returns:
+            合并后的 x（同一张量，原地修改）
+        """
+        if self.is_empty:
+            return x
+
+        original_shape = x.shape
+        device = self._pending[0][3]
+
+        # 等待所有 CPU FFN 完成，构建输出缓冲区
+        buffer = torch.zeros(original_shape, dtype=torch.float32, device=device)
+
+        n_merged = 0
+        for future, flat_idx, rw, dev, dt in self._pending:
+            try:
+                cpu_out = future.result()  # 阻塞等待 CPU FFN（已含 route_weight）
+                gpu_out = torch.from_numpy(cpu_out).to(dev, dtype=torch.float32)
+                # flat_idx → [b, s, hc, d] 空间的索引
+                b_idx = flat_idx // (original_shape[1] * original_shape[2]) if len(original_shape) == 4 else 0
+                s_idx = (flat_idx // original_shape[2]) % original_shape[1] if len(original_shape) == 4 else 0
+                hc_idx = flat_idx % original_shape[2] if len(original_shape) == 4 else 0
+                if len(original_shape) == 4:
+                    buffer[b_idx, s_idx, hc_idx] += gpu_out
+                else:
+                    buffer[flat_idx] += gpu_out
+                n_merged += 1
+            except Exception as e:
+                print(f"[DeferredExpert] CPU FFN failed: {e}")
+
+        self._pending.clear()
+
+        # delta = post * CPU_experts（CPU 专家对上一层 block 输出的贡献）
+        if self._post is not None:
+            # post: [b, s, hc_mult] → unsqueeze(-1) → [b, s, hc_mult, 1]
+            post_expanded = self._post.to(device).unsqueeze(-1)
+            buffer = post_expanded * buffer  # [b, s, hc_mult, dim]
+
+        # HC 一阶校正：correction = sum(comb_attn * delta, dim=hc_src)
+        # delta 应加到 block 输入，但 attention 已用不完整输入计算
+        # hc_post(y, residual, post, comb) = post*y + sum(comb*residual)
+        # 对 residual (即 block 输入) 的线性校正 = sum(comb * delta)
+        if comb is not None:
+            # comb: [b, s, hc_mult, hc_mult], buffer (delta): [b, s, hc_mult, dim]
+            # correction[b,s,i,d] = sum_j(comb[b,s,i,j] * delta[b,s,j,d])
+            correction = torch.einsum('bsij,bsjd->bsid', comb.to(device), buffer)
+            x = x + correction.to(x.dtype)
+        else:
+            # 无 comb 时直接加 delta（零阶近似，仅对标准残差连接正确）
+            x = x + buffer.to(x.dtype)
+
+        return x
+
 
 # =============================================================================
 # DeepSeek V4 PyTorch 模型核心实现
@@ -1048,8 +1238,16 @@ class MoE(nn.Module):
         """
         shape = x.size()
         x = x.view(-1, self.dim)
+
+        _t0 = _time.time() if _TIMING_ENABLED else 0
+
         # 计算路由分数和专家索引
         weights, indices = self.gate(x, input_ids.flatten())
+
+        if _TIMING_ENABLED:
+            _TIMING[f'L{self.layer_id}_gate'] = _TIMING.get(f'L{self.layer_id}_gate', 0.0) + _time.time() - _t0
+            _t0 = _time.time()
+
         # 累加各专家输出的缓冲区（fp32 保证精度）
         y = torch.zeros_like(x, dtype=torch.float32)
         # 统计每个专家被激活的次数，仅计算有 token 路由到的专家
@@ -1059,12 +1257,6 @@ class MoE(nn.Module):
         activated = unique_experts.tolist()
 
         # 流式加载回调：仅加载激活的 top-k 专家到 GPU（而非全部 256 个）
-        # 由 generate.py 的 load_weights_streaming 设置，避免 GPU OOM
-        # _on_experts_needed 内部调用 _load_activated_experts，负责：
-        #   1. 创建 Expert 空壳（CPU 上）
-        #   2. 从缓存/SSD 加载权重到 GPU
-        #   3. 将 GPU 参数设置到 Expert 对象上
-        # 因此此处不再调用 _ensure_expert，避免创建 CPU 空壳导致 fp4_gemm 收到 CPU 权重
         if self._on_experts_needed is not None:
             self._on_experts_needed(activated)
 
@@ -1081,39 +1273,90 @@ class MoE(nn.Module):
         # 逐专家计算：GPU 命中走 GPU，未命中走 CPU（混合推理）
         gpu_count = 0
         cpu_count = 0
-        cpu_expert_ids = []  # 收集需要 CPU 计算的专家
+        gpu_expert_ids = []   # GPU 权重命中的专家
+        cpu_expert_ids = []   # 需要 CPU/GPU FFN 缓存计算的专家
+        gpu_ffn_hits_before = getattr(self._cpu_expert_runner, '_gpu_ffn_hit', 0) if self._cpu_expert_runner else 0
 
+        # P1 层内重叠：CPU miss 先提交异步线程池，GPU hit 后计算，最后等 CPU 结果
+        # 分类阶段：区分 GPU 权重命中 vs CPU 路径
         for i in expert_inputs:
             expert = self.experts[i]
-            xi, idx, top = expert_inputs[i]
-
             if expert is not None:
-                # GPU 路径：专家权重已在 GPU 上
-                y[idx] += expert(xi, weights[idx, top, None])
+                gpu_expert_ids.append(i)
                 gpu_count += 1
             else:
-                # CPU 路径：收集待计算的专家，稍后批量处理
                 if self._cpu_expert_runner is not None:
                     cpu_expert_ids.append(i)
                     cpu_count += 1
 
-        # 批量 CPU FFN：一次性传输所有 CPU 专家的输入，并行计算
+        # P1 层内重叠：CPU miss 先提交异步线程池，GPU hit 后计算，最后等 CPU 结果
+        # 好处：CPU 和 GPU 计算重叠，FFN 输出完整，无需跨层 HC 校正
+        pending_cpu = []  # (future, flat_idx)
+
+        # P2: CPU miss 提前提交异步线程池（在 GPU hit 计算之前）
+        # 让 CPU 线程更早开始工作，最大化 CPU-GPU 并行重叠
         if cpu_expert_ids and self._cpu_expert_runner is not None:
             for i in cpu_expert_ids:
                 xi, idx, top = expert_inputs[i]
                 for k in range(xi.shape[0]):
                     rw = weights[idx[k], top[k]].item() if weights.dim() == 2 else weights[idx[k], top[k], 0].item()
-                    cpu_out = self._cpu_expert_runner.compute_expert_cpu(
-                        self.layer_id, i, xi[k], route_weight=rw,
-                        swiglu_limit=self._expert_swiglu_limit
-                    )
-                    y[idx[k]] += cpu_out
-                # else: 无 CPU 推理能力，跳过（输出为 0）
+                    # 先检查 GPU FFN 缓存（同步，快速）
+                    gpu_hit = False
+                    if (hasattr(self._cpu_expert_runner, '_mixed_pool') and
+                            self._cpu_expert_runner._mixed_pool is not None and
+                            self._cpu_expert_runner._mixed_pool._gpu_ffn and
+                            self._cpu_expert_runner._mixed_pool.gpu_cache_contains(self.layer_id, i)):
+                        try:
+                            x_bf16 = xi[k].unsqueeze(0) if xi[k].dim() == 1 else xi[k]
+                            gpu_out = self._cpu_expert_runner._mixed_pool.compute_ffn_gpu(
+                                self.layer_id, i, x_bf16, route_weight=rw)
+                            if gpu_out is not None:
+                                y[idx[k]] += gpu_out.squeeze(0) if gpu_out.shape[0] == 1 else gpu_out
+                                self._cpu_expert_runner._gpu_ffn_hit = getattr(self._cpu_expert_runner, '_gpu_ffn_hit', 0) + 1
+                                self._cpu_expert_runner._mixed_pool.record_gpu_ffn_hit()
+                                gpu_hit = True
+                        except Exception:
+                            pass
+                    if not gpu_hit:
+                        # CPU miss：提交异步线程池（P1 层内重叠）
+                        # compute_ffn_async 内部已乘 route_weight
+                        if hasattr(self._cpu_expert_runner, '_mixed_pool') and self._cpu_expert_runner._mixed_pool is not None:
+                            self._cpu_expert_runner._mixed_pool.record_gpu_ffn_miss()
+                        x_cpu = xi[k].float().cpu().numpy()
+                        future = self._cpu_expert_runner._mixed_pool.compute_ffn_async(
+                            self.layer_id, i, x_cpu, route_weight=rw,
+                            swiglu_limit=self._expert_swiglu_limit)
+                        pending_cpu.append((future, idx[k].item()))
+
+        # P1: GPU hit 在 CPU miss 提交之后计算，最大化重叠
+        for i in gpu_expert_ids:
+            expert = self.experts[i]
+            xi, idx, top = expert_inputs[i]
+            y[idx] += expert(xi, weights[idx, top, None])
+
+        # P1: 等待 CPU 异步结果，完成当前层 MoE（层内重叠，无需跨层延迟）
+        for future, flat_idx in pending_cpu:
+            try:
+                cpu_out = future.result()  # 阻塞等待（CPU 已在 GPU 计算期间并行执行）
+                gpu_out = torch.from_numpy(cpu_out).to(x.device, dtype=torch.float32)
+                y[flat_idx] += gpu_out  # compute_ffn_async 已乘 route_weight
+            except Exception as e:
+                print(f"[MoE] CPU FFN failed: {e}")
+
+        if _TIMING_ENABLED:
+            _TIMING[f'L{self.layer_id}_expert'] = _TIMING.get(f'L{self.layer_id}_expert', 0.0) + _time.time() - _t0
+            _t0 = _time.time()
 
         # 混合推理统计（每 10 层打印一次）
-        if cpu_count > 0 and self.layer_id % 10 == 0:
-            total = gpu_count + cpu_count
-            print(f"[MoE] L{self.layer_id}: GPU={gpu_count}/{total}, CPU={cpu_count}/{total}")
+        if self.layer_id % 10 == 0:
+            # 统计 GPU FFN 命中数（mixed_quant_gemm 路径）
+            gpu_ffn_hits_after = getattr(self._cpu_expert_runner, '_gpu_ffn_hit', 0) if self._cpu_expert_runner else 0
+            gpu_ffn_count = gpu_ffn_hits_after - gpu_ffn_hits_before
+            total = len(activated)
+            # gpu_count = IQ2_XS/FP4 GPU SLRU 命中, gpu_ffn_count = MixedQuant GPU FFN 命中
+            actual_gpu = gpu_count + gpu_ffn_count
+            actual_cpu = total - actual_gpu
+            print(f"[MoE] L{self.layer_id}: GPU={actual_gpu}/{total} (ffn={gpu_ffn_count}), CPU={actual_cpu}/{total}")
 
         # 预取下一层热专家到 CPU Rust SLRU（在当前层计算完成后）
         if self._cpu_expert_runner is not None:
@@ -1128,6 +1371,10 @@ class MoE(nn.Module):
             dist.all_reduce(y)
         # 加上共享专家的输出（所有 token 都经过）
         y += self.shared_experts(x)
+
+        if _TIMING_ENABLED:
+            _TIMING[f'L{self.layer_id}_shared'] = _TIMING.get(f'L{self.layer_id}_shared', 0.0) + _time.time() - _t0
+
         return y.type_as(x).view(shape)
 
 
@@ -1143,6 +1390,7 @@ class Block(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.layer_id = layer_id
+        self.dim = args.dim
         self.norm_eps = args.norm_eps
         self.attn = Attention(layer_id, args)
         self.ffn = MoE(layer_id, args)
@@ -1201,7 +1449,7 @@ class Block(nn.Module):
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]):
         """Transformer 块前向传播。
 
         参数:
@@ -1210,8 +1458,10 @@ class Block(nn.Module):
           input_ids: token ID（用于 MoE 的 hash 路由）
 
         返回:
-          [bsz, seqlen, hc_mult, dim] 输出的多个隐状态副本
+          x: 输出隐状态
         """
+        _t0 = _time.time() if _TIMING_ENABLED else 0
+
         # Attention 子层
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
@@ -1219,12 +1469,20 @@ class Block(nn.Module):
         x = self.attn(x, start_pos)
         x = self.hc_post(x, residual, post, comb)
 
-        # FFN (MoE) 子层
+        if _TIMING_ENABLED:
+            _TIMING[f'L{self.layer_id}_attn'] = _TIMING.get(f'L{self.layer_id}_attn', 0.0) + _time.time() - _t0
+            _t0 = _time.time()
+
+        # FFN (MoE) 子层（P1 层内重叠：CPU miss 异步提交 → GPU hit 计算 → 等 CPU 结果）
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
+        ffn_out = self.ffn(x, input_ids)
+        x = self.hc_post(ffn_out, residual, post, comb)
+
+        if _TIMING_ENABLED:
+            _TIMING[f'L{self.layer_id}_ffn'] = _TIMING.get(f'L{self.layer_id}_ffn', 0.0) + _time.time() - _t0
+
         return x
 
 
@@ -1373,6 +1631,7 @@ class Transformer(nn.Module):
         scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
         scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
         super().__init__()
+        self.dim = args.dim
         self.max_seq_len = args.max_seq_len
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps

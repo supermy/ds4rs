@@ -418,7 +418,7 @@ impl Fp4Weight {
 
     /// 解码单个 FP4 e2m1 值为 f32
     #[inline]
-    fn decode_fp4(nibble: u8) -> f32 {
+    pub fn decode_fp4(nibble: u8) -> f32 {
         let sign = (nibble >> 3) & 1;
         let e = (nibble >> 1) & 3;
         let m = nibble & 1;
@@ -817,6 +817,231 @@ pub fn fp4_expert_ffn_pair(
     down_weight.matvec(&mid)
 }
 
+/// FP4 CPU expert FFN（amd7600 专用，rayon 并行 + amd7600 内核）
+///
+/// 优化策略：
+///   1. x_split 预拆分 x 为 x_even/x_odd，gate 和 up 共享
+///   2. gate/up 使用 rayon 并行 + fp4_vec_dot_f32_split（x_split 版）
+///   3. down 使用 rayon 并行 + fp4_vec_dot_f32_avx512（permutex2var 交错合并版）
+///   4. amd7600 内核：512-bit FMA + LUT 查表 + 4 路累加器
+pub fn fp4_expert_ffn_pair_amd7600(
+    x: &[f32],
+    gate_weight: &Fp4Weight,
+    up_weight: &Fp4Weight,
+    down_weight: &Fp4Weight,
+    route_weight: f32,
+    swiglu_limit: f32,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    let dim = gate_weight.shape.1;
+    let inter_dim = gate_weight.shape.0;
+
+    // 预拆分 x 为 x_even/x_odd，gate 和 up 共享
+    let x_split = if super::avx512::is_avx512_supported() {
+        Some(Fp4XSplit::new(x))
+    } else {
+        None
+    };
+
+    // gate + up 融合投影（行级并行）
+    let mut gate = vec![0.0f32; inter_dim];
+    let mut up = vec![0.0f32; inter_dim];
+    gate.par_iter_mut()
+        .zip(up.par_iter_mut())
+        .enumerate()
+        .for_each(|(row, (g, u))| {
+            if let Some(ref xs) = x_split {
+                *g = unsafe { gate_weight.fp4_vec_dot_f32_split(row, xs) };
+                *u = unsafe { up_weight.fp4_vec_dot_f32_split(row, xs) };
+            } else {
+                *g = gate_weight.fp4_vec_dot_f32(row, x);
+                *u = up_weight.fp4_vec_dot_f32(row, x);
+            }
+        });
+
+    // SwiGLU
+    let mut mid = vec![0.0f32; inter_dim];
+    mid.par_iter_mut().enumerate().for_each(|(i, m)| {
+        let g = gate[i];
+        let mut u = up[i];
+        if swiglu_limit > 0.0 {
+            u = u.clamp(-swiglu_limit, swiglu_limit);
+        }
+        let g_clamped = if swiglu_limit > 0.0 { g.clamp(-50.0, swiglu_limit) } else { g };
+        let sigmoid_g = 1.0 / (1.0 + exp_approx_scalar(-g_clamped));
+        *m = g * sigmoid_g * u * route_weight;
+    });
+
+    // down 投影
+    down_weight.matvec(&mid)
+}
+
+/// FP4+VNNI CPU expert FFN（amd7600 专用，VPDPBUSD 管线）
+///
+/// 与 fp4_expert_ffn_pair_amd7600 的区别：
+///   FMA: FP4→f32 LUT→mul(scale)→fmadd(x_f32)  [512-bit 浮点管线]
+///   VNNI: FP4→int8 LUT→sign→VPDPBUSD(q8)→mul(scale) [256-bit 整数管线]
+///
+/// VNNI 优势（Zen 4）：
+///   - 256-bit 原生执行（不拆分），512-bit 拆为 2×256 uops
+///   - VPDPBUSD 替代 permutexvar_ps + mul_ps + fmadd_ps 三步
+///   - 整数管线端口竞争更少
+///
+/// 代价：Q8 量化引入 ~0.1% 额外误差（vs FMA 的精确 f32）
+pub fn fp4_expert_ffn_pair_vnni_amd7600(
+    x: &[f32],
+    gate_weight: &Fp4Weight,
+    up_weight: &Fp4Weight,
+    down_weight: &Fp4Weight,
+    route_weight: f32,
+    swiglu_limit: f32,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    let dim = gate_weight.shape.1;
+    let inter_dim = gate_weight.shape.0;
+    let n_packed_per_row = dim / 2;
+    let n_scales_per_row = dim / 32;
+
+    // 预拆分 x 为 x_even/x_odd，gate 和 up 共享
+    let x_split = Fp4XSplit::new(x);
+
+    // 预量化 x_even + x_odd → Q8_0（FFN 级别，所有 chunk 共享）
+    let n_blocks = n_packed_per_row / 16;
+    let (q8_buf, q8_scales) = super::avx512::quantize_f32_to_q8_fp4_split(
+        &x_split.x_even, &x_split.x_odd, n_blocks,
+    );
+
+    // gate + up 投影（rayon 行级并行 + VNNI 内核）
+    let mut gate = vec![0.0f32; inter_dim];
+    let mut up = vec![0.0f32; inter_dim];
+
+    let chunk_size = 64usize;
+    gate.par_chunks_mut(chunk_size).zip(up.par_chunks_mut(chunk_size)).enumerate()
+        .for_each(|(chunk_idx, (gate_chunk, up_chunk))| {
+            let row_start = chunk_idx * chunk_size;
+            let row_end = (row_start + chunk_size).min(inter_dim);
+
+            // gate VNNI matvec
+            unsafe {
+                super::avx512::fp4_matvec_vnni_amd7600(
+                    &gate_weight.weight_packed,
+                    &gate_weight.scale,
+                    &q8_buf,
+                    &q8_scales,
+                    n_packed_per_row,
+                    n_scales_per_row,
+                    row_start,
+                    row_end,
+                    gate_chunk,
+                );
+            }
+
+            // up VNNI matvec
+            unsafe {
+                super::avx512::fp4_matvec_vnni_amd7600(
+                    &up_weight.weight_packed,
+                    &up_weight.scale,
+                    &q8_buf,
+                    &q8_scales,
+                    n_packed_per_row,
+                    n_scales_per_row,
+                    row_start,
+                    row_end,
+                    up_chunk,
+                );
+            }
+        });
+
+    // SwiGLU
+    let mut mid = vec![0.0f32; inter_dim];
+    mid.par_iter_mut().enumerate().for_each(|(i, m)| {
+        let g = gate[i];
+        let mut u = up[i];
+        if swiglu_limit > 0.0 {
+            u = u.clamp(-swiglu_limit, swiglu_limit);
+        }
+        let g_clamped = if swiglu_limit > 0.0 { g.clamp(-50.0, swiglu_limit) } else { g };
+        let sigmoid_g = 1.0 / (1.0 + exp_approx_scalar(-g_clamped));
+        *m = g * sigmoid_g * u * route_weight;
+    });
+
+    // down 投影（VNNI direct 版）
+    let dim_out = down_weight.shape.0;
+    let down_n_packed = down_weight.shape.1 / 2;
+    let down_n_scales = down_weight.shape.1 / 32;
+    let mut output = vec![0.0f32; dim_out];
+
+    // 预量化 mid → Q8_0（FFN 级别，所有 chunk 共享）
+    let down_n_blocks = down_n_packed / 16;
+    let (down_q8_buf, down_q8_scales) = super::avx512::quantize_f32_to_q8_fp4_direct(
+        &mid, down_n_blocks,
+    );
+
+    output.par_chunks_mut(chunk_size).enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let row_start = chunk_idx * chunk_size;
+            let row_end = (row_start + chunk_size).min(dim_out);
+            unsafe {
+                super::avx512::fp4_matvec_vnni_amd7600_direct(
+                    &down_weight.weight_packed,
+                    &down_weight.scale,
+                    &down_q8_buf,
+                    &down_q8_scales,
+                    down_n_packed,
+                    down_n_scales,
+                    row_start,
+                    row_end,
+                    out_chunk,
+                );
+            }
+        });
+
+    output
+}
+
+/// FP4 6 专家 FFN（amd7600 专用，rayon 并行）
+///
+/// 与 IQ2_XXS 版本类似：rayon 专家级并行 + rayon 行级并行
+/// DDR5 带宽瓶颈下 6 专家并行不可行，但 rayon 专家级并行仍有收益
+pub fn fp4_ffn_6experts_amd7600(
+    x: &[f32],
+    gate_weights: &[&Fp4Weight],
+    up_weights: &[&Fp4Weight],
+    down_weights: &[&Fp4Weight],
+    route_weights: &[f32],
+    swiglu_limit: f32,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    let n_experts = gate_weights.len();
+    assert_eq!(up_weights.len(), n_experts);
+    assert_eq!(down_weights.len(), n_experts);
+    assert_eq!(route_weights.len(), n_experts);
+
+    // 预拆分 x（所有专家共享）
+    let x_split = Fp4XSplit::new(x);
+
+    // 6 专家并行计算
+    let results: Vec<Vec<f32>> = (0..n_experts).into_par_iter().map(|ei| {
+        fp4_expert_ffn_pair_amd7600(
+            x, gate_weights[ei], up_weights[ei], down_weights[ei],
+            route_weights[ei], swiglu_limit,
+        )
+    }).collect();
+
+    // 加权累加
+    let dim_out = results[0].len();
+    let mut output = vec![0.0f32; dim_out];
+    for result in &results {
+        for (o, r) in output.iter_mut().zip(result.iter()) {
+            *o += r;
+        }
+    }
+    output
+}
+
 /// 预拆分的 x 向量，供 FP4 AVX-512 内核共享使用
 ///
 /// 将 x 拆分为偶数位和奇数位：
@@ -825,7 +1050,7 @@ pub fn fp4_expert_ffn_pair(
 ///
 /// 这样 lo 权重直接与 x_even 对齐，hi 权重直接与 x_odd 对齐，
 /// 省去 permutex2var_ps 权重合并操作。
-struct Fp4XSplit {
+pub struct Fp4XSplit {
     x_even: Vec<f32>,
     x_odd: Vec<f32>,
     n_blocks: usize,

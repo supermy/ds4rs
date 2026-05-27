@@ -30,6 +30,25 @@ pub fn f32_to_fp8_e4m3(v: f32) -> u8 {
     (sign << 7) | ((exp_fp8 as u8) << 3) | mant_fp8
 }
 
+pub fn dequant_fp8_e4m3_to_f32(data: &[u8], scales: &[u8], shape: &[usize]) -> Result<Vec<f32>> {
+    let n_elements: usize = shape.iter().product();
+    let block_size = 128;
+    let last_dim = shape.last().copied().unwrap_or(1);
+    let n_blocks_col = (last_dim + block_size - 1) / block_size;
+
+    let mut out = vec![0.0f32; n_elements];
+    for i in 0..n_elements {
+        let row = i / last_dim;
+        let col = i % last_dim;
+        let block_row = row / block_size;
+        let block_col = col / block_size;
+        let scale_idx = block_row * n_blocks_col + block_col;
+        let scale_f32 = if scale_idx < scales.len() { e8m0_to_f32(scales[scale_idx]) } else { 1.0 };
+        out[i] = fp8_e4m3_to_f32(data[i]) * scale_f32;
+    }
+    Ok(out)
+}
+
 pub fn dequant_fp8_e4m3_to_bf16(data: &[u8], scales: &[u8], shape: &[usize]) -> Result<CpuTensor> {
     let n_elements: usize = shape.iter().product();
     let block_size = 128;

@@ -58,8 +58,19 @@ impl Gate {
 
         let (bias_cpu, bias_gpu) = bias.map(|b| {
             let host = b.to_host().unwrap();
-            let bf16: &[half::bf16] = bytemuck::cast_slice(&host.data);
-            let cpu: Vec<f32> = bf16.iter().map(|v| v.to_f32()).collect();
+            let cpu: Vec<f32> = match host.dtype {
+                DType::FP32 => {
+                    bytemuck::cast_slice(&host.data).to_vec()
+                }
+                DType::BF16 => {
+                    let bf16: &[half::bf16] = bytemuck::cast_slice(&host.data);
+                    bf16.iter().map(|v| v.to_f32()).collect()
+                }
+                _ => {
+                    // 其他 dtype 尝试按 FP32 解读
+                    bytemuck::cast_slice(&host.data).to_vec()
+                }
+            };
             let n = cpu.len();
             let cpu_tensor = CpuTensor::new(
                 bytemuck::cast_slice(&cpu).to_vec(),

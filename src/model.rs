@@ -6,7 +6,7 @@ use crate::rope::RopeCache;
 use crate::tensor::{CpuTensor, GpuTensor};
 use crate::tvm_ffi::KernelRegistry;
 use crate::weight::WeightLoader;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use cudarc::driver::CudaContext;
 use std::sync::Arc;
 
@@ -56,6 +56,7 @@ pub struct Transformer {
     pub layers: Vec<TransformerLayer>,
     pub embed_cpu: CpuTensor,
     pub head_weight_cpu: CpuTensor,
+    pub head_weight_gpu: GpuTensor,
     pub head_scale: Option<GpuTensor>,
     pub norm_weight: GpuTensor,
     pub hc_head_fn: GpuTensor,
@@ -123,6 +124,9 @@ impl Transformer {
             CpuTensor::new(bytemuck::cast_slice(&f32_data).to_vec(), embed_cpu.shape.clone(), DType::FP32)
         };
 
+        // head_weight 延迟上传 GPU：层加载后再上传，避免抢占层权重的显存
+        // head_weight_gpu 将在层加载完成后初始化
+
         let head_scale = if loader.contains("head.scale") {
             let s = loader.load("head.scale")?;
             let gs = GpuTensor::from_host(device.clone(), &s)?;
@@ -181,6 +185,20 @@ impl Transformer {
         eprintln!("[load] 模型加载完成: {} 层", config.num_hidden_layers);
         log_vram(&device, "加载完成");
 
+        // head_weight 上传 GPU (FP32 保证 logits 精度，cuBLAS FP32 GEMM)
+        // 延迟到层加载后，避免抢占层权重的显存
+        let head_weight_gpu = match GpuTensor::from_host(device.clone(), &head_weight_cpu) {
+            Ok(gpu) => {
+                log_tensor_gpu("head.weight (FP32)", &gpu);
+                gpu
+            }
+            Err(e) => {
+                eprintln!("[load] WARNING: head_weight GPU upload failed ({}), will use CPU fallback", e);
+                GpuTensor::zeros(device.clone(), vec![0], DType::FP32)?
+            }
+        };
+        log_vram(&device, "head.weight 上传后");
+
         // 打印 RAM 使用估算
         let embed_ram = embed_cpu.data.len();
         let total_ram_estimate = embed_ram + config.num_hidden_layers * 256 * 12 * 1024 * 1024; // 粗略估算专家 CPU 缓存
@@ -193,6 +211,7 @@ impl Transformer {
             layers,
             embed_cpu,
             head_weight_cpu,
+            head_weight_gpu,
             head_scale,
             norm_weight,
             hc_head_fn,
@@ -336,6 +355,128 @@ impl Transformer {
         GpuTensor::from_host(self.device.clone(), &cpu)
     }
 
+    fn reshape(&self, t: &GpuTensor, new_shape: &[usize]) -> Result<GpuTensor> {
+        let old_nbytes: usize = t.shape.iter().product::<usize>() * t.dtype.element_size();
+        let new_nbytes: usize = new_shape.iter().product::<usize>() * t.dtype.element_size();
+        if old_nbytes != new_nbytes {
+            return Err(anyhow!(
+                "reshape size mismatch: {:?} ({}) vs {:?} ({})",
+                t.shape, old_nbytes, new_shape, new_nbytes
+            ));
+        }
+        Ok(GpuTensor {
+            slice: t.slice.clone(),
+            shape: new_shape.to_vec(),
+            dtype: t.dtype,
+            device: t.device.clone(),
+        })
+    }
+
+    fn cast_to_f32(&self, x: &GpuTensor) -> Result<GpuTensor> {
+        if x.dtype == DType::FP32 {
+            return Ok(x.clone());
+        }
+        if x.dtype != DType::BF16 {
+            return Err(anyhow!("cast_to_f32: unsupported dtype {:?}", x.dtype));
+        }
+        let n = x.shape.iter().product::<usize>();
+        let last_dim = *x.shape.last().unwrap_or(&1);
+        let device = x.device.clone();
+
+        let kernel_name = match last_dim {
+            128 => Some("cast_bf16_to_f32_N128"),
+            512 => Some("cast_bf16_to_f32_N512"),
+            1024 => Some("cast_bf16_to_f32_N1024"),
+            4096 => Some("cast_bf16_to_f32_N4096"),
+            8192 => Some("cast_bf16_to_f32_N8192"),
+            16384 => Some("cast_bf16_to_f32_N16384"),
+            _ => None,
+        };
+
+        if let Some(kname) = kernel_name {
+            let m = n / last_dim;
+            let x_2d = GpuTensor {
+                slice: x.slice.clone(),
+                shape: vec![m, last_dim],
+                dtype: DType::BF16,
+                device: device.clone(),
+            };
+            let y_2d = GpuTensor::zeros(device.clone(), vec![m, last_dim], DType::FP32)?;
+            self.kernels.call(kname, &[&x_2d, &y_2d])
+                .with_context(|| format!("cast_to_f32 kernel {} failed", kname))?;
+            return Ok(GpuTensor {
+                slice: y_2d.slice,
+                shape: x.shape.clone(),
+                dtype: DType::FP32,
+                device,
+            });
+        }
+
+        // Fallback: D2H → cast → H2D (for small tensors)
+        let x_host = x.to_host()?;
+        let bf16: &[half::bf16] = bytemuck::cast_slice(&x_host.data);
+        let f32_data: Vec<f32> = bf16.iter().map(|v| v.to_f32()).collect();
+        let cpu = CpuTensor::new(bytemuck::cast_slice(&f32_data).to_vec(), x_host.shape.clone(), DType::FP32);
+        GpuTensor::from_host(device, &cpu)
+    }
+
+    fn cast_to_bf16(&self, x: &GpuTensor) -> Result<GpuTensor> {
+        if x.dtype == DType::BF16 {
+            return Ok(x.clone());
+        }
+        if x.dtype != DType::FP32 {
+            return Err(anyhow!("cast_to_bf16: unsupported dtype {:?}", x.dtype));
+        }
+        let n = x.shape.iter().product::<usize>();
+        let last_dim = *x.shape.last().unwrap_or(&1);
+        let device = x.device.clone();
+
+        let kernel_name = match last_dim {
+            128 => Some("cast_f32_to_bf16_N128"),
+            512 => Some("cast_f32_to_bf16_N512"),
+            1024 => Some("cast_f32_to_bf16_N1024"),
+            4096 => Some("cast_f32_to_bf16_N4096"),
+            16384 => Some("cast_f32_to_bf16_N16384"),
+            _ => None,
+        };
+
+        if let Some(kname) = kernel_name {
+            let m = n / last_dim;
+            let x_2d = GpuTensor {
+                slice: x.slice.clone(),
+                shape: vec![m, last_dim],
+                dtype: DType::FP32,
+                device: device.clone(),
+            };
+            let y_2d = GpuTensor::zeros(device.clone(), vec![m, last_dim], DType::BF16)?;
+            self.kernels.call(kname, &[&x_2d, &y_2d])
+                .with_context(|| format!("cast_to_bf16 kernel {} failed", kname))?;
+            return Ok(GpuTensor {
+                slice: y_2d.slice,
+                shape: x.shape.clone(),
+                dtype: DType::BF16,
+                device,
+            });
+        }
+
+        // Fallback: D2H → cast → H2D
+        let x_host = x.to_host()?;
+        let f32_data: &[f32] = bytemuck::cast_slice(&x_host.data);
+        let bf16_data: Vec<half::bf16> = f32_data.iter().map(|v| half::bf16::from_f32(*v)).collect();
+        let cpu = CpuTensor::new(bytemuck::cast_slice(&bf16_data).to_vec(), x_host.shape.clone(), DType::BF16);
+        GpuTensor::from_host(device, &cpu)
+    }
+
+    fn gemm_f32(&self, x: &GpuTensor, weight: &GpuTensor) -> Result<GpuTensor> {
+        let m = x.shape.iter().rev().skip(1).product::<usize>();
+        let k = *x.shape.last().unwrap_or(&1);
+        let n = weight.shape[0];
+        let device = x.device.clone();
+        let mut c = GpuTensor::zeros(device, vec![m, n], DType::FP32)?;
+        self.cublas.gemm_f32(m, n, k, x, weight, &mut c, 1.0, 0.0)?;
+        Ok(c)
+    }
+
     fn hc_expand(&self, x: &GpuTensor, hc: usize) -> Result<GpuTensor> {
         let bsz = x.shape[0];
         let seqlen = x.shape[1];
@@ -366,149 +507,303 @@ impl Transformer {
         let hc = x.shape[2];
         let dim = x.shape[3];
         let device = x.device.clone();
-        let norm_eps = 1e-6f32;
-        let hc_eps = 1e-6f32;
+        let total = bsz * seqlen;
+        let hc_dim = hc * dim;
 
-        let x_host = x.to_host()?;
-        let x_f32: Vec<f32> = if x_host.dtype == DType::BF16 {
-            let bf16: &[half::bf16] = bytemuck::cast_slice(&x_host.data);
-            bf16.iter().map(|v| v.to_f32()).collect()
-        } else {
-            bytemuck::cast_slice(&x_host.data).to_vec()
+        // Step 1: x BF16 → FP32, reshape [total, hc*dim]
+        let x_f32 = self.cast_to_f32(x)?;
+        let x_flat = self.reshape(&x_f32, &[total, hc_dim])?;
+
+        // Step 2: rmsnorm_f32 (no weight) → x_normed
+        let x_normed = {
+            let kernel_name = match hc_dim {
+                16384 => "rmsnorm_f32_N16384",
+                4096 => "rmsnorm_f32_N4096",
+                _ => {
+                    return Err(anyhow!(
+                        "hc_head_reduce: no rmsnorm_f32 kernel for hc*dim={}", hc_dim
+                    ));
+                }
+            };
+            let y = GpuTensor::zeros(device.clone(), vec![total, hc_dim], DType::FP32)?;
+            self.kernels.call(kernel_name, &[&x_flat, &y])
+                .with_context(|| format!("hc_head_reduce rmsnorm_f32 kernel {} failed", kernel_name))?;
+            y
         };
 
-        let fn_host = self.hc_head_fn.to_host()?;
-        let fn_f32: &[f32] = bytemuck::cast_slice(&fn_host.data);
-        let scale_host = self.hc_head_scale.to_host()?;
-        let scale_f32: &[f32] = bytemuck::cast_slice(&scale_host.data);
-        let base_host = self.hc_head_base.to_host()?;
-        let base_f32: &[f32] = bytemuck::cast_slice(&base_host.data);
+        // Step 3: GEMM x_normed @ hc_head_fn^T → mixes [total, hc]
+        let hc_fn_f32 = self.cast_to_f32(&self.hc_head_fn)?;
+        let mixes = self.gemm_f32(&x_normed, &hc_fn_f32)?;
 
-        let n = bsz * seqlen;
-        let x_dim = hc * dim;
+        // Step 4: hc_sigmoid_hc4 kernel: sigmoid(mixes * scale + base) + eps → pre [total, hc] BF16
+        let hc_scale_f32 = self.cast_to_f32(&self.hc_head_scale)?;
+        let hc_base_f32 = self.cast_to_f32(&self.hc_head_base)?;
+        let pre_bf16 = GpuTensor::zeros(device.clone(), vec![total, hc], DType::BF16)?;
+        self.kernels.call(
+            "hc_sigmoid_hc4",
+            &[&mixes, &hc_scale_f32, &hc_base_f32, &pre_bf16],
+        ).with_context(|| "hc_sigmoid_hc4 kernel failed")?;
 
-        let mut mixes = vec![0.0f32; n * hc];
-        for i in 0..n {
-            let x_row = &x_f32[i * x_dim..(i + 1) * x_dim];
-            let mean_sq = x_row.iter().map(|v| v * v).sum::<f32>() / x_dim as f32;
-            let rsqrt = 1.0 / (mean_sq + norm_eps).sqrt();
+        // Step 5: Cast pre to FP32
+        let pre_f32 = self.cast_to_f32(&pre_bf16)?;
 
-            for h in 0..hc {
-                let mut dot = 0.0f32;
-                for d in 0..x_dim {
-                    dot += x_row[d] * fn_f32[h * x_dim + d];
+        // Step 6: hc_reduce: y[i,d] = sum_h pre[i,h] * x[i,h,d]
+        // Using strided batched GEMM: for each batch i, C[i] = pre[i] @ x[i]
+        // pre_f32: [total, hc], x_f32: [total, hc, dim] → y_f32: [total, dim]
+        let pre_2d = GpuTensor {
+            slice: pre_f32.slice.clone(),
+            shape: vec![total, hc],
+            dtype: DType::FP32,
+            device: device.clone(),
+        };
+        let x_3d = GpuTensor {
+            slice: x_f32.slice.clone(),
+            shape: vec![total, hc, dim],
+            dtype: DType::FP32,
+            device: device.clone(),
+        };
+        let mut y_f32 = GpuTensor::zeros(device.clone(), vec![total, dim], DType::FP32)?;
+        self.cublas.gemm_f32_nn_strided_batched(
+            1, dim, hc,
+            &pre_2d, &x_3d, &mut y_f32,
+            hc as i64, (hc * dim) as i64, dim as i64,
+            total as i32,
+            1.0, 0.0,
+        )?;
+
+        // Debug: 对比 GPU 和 CPU 结果（仅第一次）
+        static DEBUG_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+        let dc = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dc < 1 {
+            // CPU 参考实现
+            let x_host = x.to_host()?;
+            let x_cpu: Vec<f32> = if x_host.dtype == DType::BF16 {
+                let bf16: &[half::bf16] = bytemuck::cast_slice(&x_host.data);
+                bf16.iter().map(|v| v.to_f32()).collect()
+            } else {
+                bytemuck::cast_slice(&x_host.data).to_vec()
+            };
+            let fn_host = self.hc_head_fn.to_host()?;
+            let fn_cpu: Vec<f32> = if fn_host.dtype == DType::BF16 {
+                let bf16: &[half::bf16] = bytemuck::cast_slice(&fn_host.data);
+                bf16.iter().map(|v| v.to_f32()).collect()
+            } else {
+                bytemuck::cast_slice(&fn_host.data).to_vec()
+            };
+            let scale_host = self.hc_head_scale.to_host()?;
+            let scale_f32: f32 = if scale_host.dtype == DType::BF16 {
+                let bf16: &[half::bf16] = bytemuck::cast_slice(&scale_host.data);
+                bf16[0].to_f32()
+            } else {
+                bytemuck::cast_slice(&scale_host.data)[0]
+            };
+            let base_host = self.hc_head_base.to_host()?;
+            let base_cpu: Vec<f32> = if base_host.dtype == DType::BF16 {
+                let bf16: &[half::bf16] = bytemuck::cast_slice(&base_host.data);
+                bf16.iter().map(|v| v.to_f32()).collect()
+            } else {
+                bytemuck::cast_slice(&base_host.data).to_vec()
+            };
+
+            let norm_eps = 1e-6;
+            let hc_eps = 1e-6;
+            let mut y_cpu = vec![0.0f32; total * dim];
+            for i in 0..total {
+                let x_row = &x_cpu[i * hc_dim..(i + 1) * hc_dim];
+                let mean_sq: f32 = x_row.iter().map(|v| v * v).sum::<f32>() / hc_dim as f32;
+                let rsqrt = 1.0 / (mean_sq + norm_eps).sqrt();
+                for h in 0..hc {
+                    let mut dot = 0.0f32;
+                    for d in 0..hc_dim {
+                        dot += x_row[d] * fn_cpu[h * hc_dim + d];
+                    }
+                    let mix_val = dot * rsqrt;
+                    let pre_val = 1.0 / (1.0 + (-mix_val * scale_f32 - base_cpu[h]).exp()) + hc_eps;
+                    for d in 0..dim {
+                        y_cpu[i * dim + d] += pre_val * x_cpu[i * hc_dim + h * dim + d];
+                    }
                 }
-                mixes[i * hc + h] = dot * rsqrt;
             }
-        }
 
-        // 官方实现: pre = sigmoid(mixes * hc_scale + hc_base) + eps
-        // hc_head_scale 是标量 (shape=[1])，广播到所有 hc 分支
-        // hc_head_base 是向量 (shape=[hc_mult])，每个分支独立偏置
-        let s = scale_f32[0];
-        let mut pre = vec![0.0f32; n * hc];
-        for i in 0..n {
-            for h in 0..hc {
-                let b = base_f32[h];
-                pre[i * hc + h] = 1.0 / (1.0 + (-(mixes[i * hc + h] * s + b)).exp()) + hc_eps;
-            }
-        }
+            // GPU 结果
+            let y_host = y_f32.to_host()?;
+            let y_gpu: &[f32] = bytemuck::cast_slice(&y_host.data);
 
-        let mut y = vec![0.0f32; n * dim];
-        for i in 0..n {
-            for h in 0..hc {
-                let w = pre[i * hc + h];
-                for d in 0..dim {
-                    y[i * dim + d] += w * x_f32[i * x_dim + h * dim + d];
+            // 对比
+            let mut max_diff = 0.0f32;
+            let mut max_diff_idx = 0;
+            for (idx, (a, b)) in y_cpu.iter().zip(y_gpu.iter()).enumerate() {
+                let diff = (a - b).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                    max_diff_idx = idx;
                 }
             }
+            let cpu_min = y_cpu.iter().cloned().fold(f32::INFINITY, f32::min);
+            let cpu_max = y_cpu.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let gpu_min = y_gpu.iter().cloned().fold(f32::INFINITY, f32::min);
+            let gpu_max = y_gpu.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("[hc_head_reduce DEBUG] CPU: min={:.4} max={:.4} | GPU: min={:.4} max={:.4} | max_diff={:.6} at idx={}",
+                cpu_min, cpu_max, gpu_min, gpu_max, max_diff, max_diff_idx);
+            if max_diff > 0.01 {
+                let i = max_diff_idx / dim;
+                let d = max_diff_idx % dim;
+                eprintln!("[hc_head_reduce DEBUG]   CPU[{},{}] = {:.6}, GPU[{},{}] = {:.6}",
+                    i, d, y_cpu[max_diff_idx], i, d, y_gpu[max_diff_idx]);
+                // 打印 pre 值对比
+                let pre_host = pre_f32.to_host()?;
+                let pre_gpu: &[f32] = bytemuck::cast_slice(&pre_host.data);
+                eprintln!("[hc_head_reduce DEBUG]   pre_gpu[0] = {:?}", &pre_gpu[0..hc.min(4)]);
+                // 打印 mixes
+                let mixes_host = mixes.to_host()?;
+                let mixes_gpu: &[f32] = bytemuck::cast_slice(&mixes_host.data);
+                eprintln!("[hc_head_reduce DEBUG]   mixes_gpu[0] = {:?}", &mixes_gpu[0..hc.min(4)]);
+                eprintln!("[hc_head_reduce DEBUG]   scale={:.6} base={:?}", scale_f32, &base_cpu[..hc.min(4)]);
+            }
         }
 
-        let y_bytes: Vec<u8> = bytemuck::cast_slice(&y).to_vec();
-        let y_cpu = CpuTensor::new(y_bytes, vec![bsz, seqlen, dim], DType::FP32);
-        GpuTensor::from_host(device, &y_cpu)
+        // Step 7: Cast y to BF16 → [bsz, seqlen, dim]
+        let y_bf16 = self.cast_to_bf16(&y_f32)?;
+        Ok(GpuTensor {
+            slice: y_bf16.slice,
+            shape: vec![bsz, seqlen, dim],
+            dtype: DType::BF16,
+            device: y_bf16.device,
+        })
     }
 
     fn rmsnorm(&self, x: &GpuTensor, weight: &GpuTensor) -> Result<GpuTensor> {
-        let x_host = x.to_host()?;
-        let w_host = weight.to_host()?;
-        let x_f32: Vec<f32> = if x_host.dtype == DType::BF16 {
-            let bf16: &[half::bf16] = bytemuck::cast_slice(&x_host.data);
-            bf16.iter().map(|v| v.to_f32()).collect()
+        let device = x.device.clone();
+        let shape = x.shape.clone();
+        let last_dim = shape.last().copied().unwrap_or(1);
+
+        // TileLang rmsnorm kernel: BF16 input, FP32 weight, BF16 output
+        let x_bf16 = if x.dtype == DType::BF16 {
+            x.clone()
         } else {
-            bytemuck::cast_slice(&x_host.data).to_vec()
+            self.cast_to_bf16(x)?
         };
-        let w_f32: Vec<f32> = if w_host.dtype == DType::BF16 {
-            let bf16: &[half::bf16] = bytemuck::cast_slice(&w_host.data);
-            bf16.iter().map(|v| v.to_f32()).collect()
+        let w_f32 = if weight.dtype == DType::FP32 {
+            weight.clone()
         } else {
-            bytemuck::cast_slice(&w_host.data).to_vec()
+            self.cast_to_f32(weight)?
         };
 
-        let n = x.shape[0] * x.shape[1];
-        let dim = x.shape[2];
-        let eps = 1e-6f32;
-
-        let mut out = vec![0.0f32; x_f32.len()];
-        for i in 0..n {
-            let ss: f32 = x_f32[i * dim..(i + 1) * dim].iter().map(|v| v * v).sum::<f32>() / dim as f32;
-            let inv_rms = 1.0 / (ss + eps).sqrt();
-            for d in 0..dim {
-                out[i * dim + d] = x_f32[i * dim + d] * inv_rms * w_f32[d];
+        let kernel_name = match last_dim {
+            4096 => "rmsnorm_N4096",
+            1024 => "rmsnorm_N1024",
+            512 => "rmsnorm_N512",
+            _ => {
+                return Err(anyhow!(
+                    "rmsnorm: no GPU kernel for last_dim={}", last_dim
+                ));
             }
-        }
+        };
 
-        let out_bytes: Vec<u8> = bytemuck::cast_slice(&out).to_vec();
-        let out_cpu = CpuTensor::new(out_bytes, x_host.shape.clone(), DType::FP32);
-        GpuTensor::from_host(x.device.clone(), &out_cpu)
+        let n_rows: usize = shape.iter().rev().skip(1).product();
+        let x_2d = GpuTensor {
+            slice: x_bf16.slice.clone(),
+            shape: vec![n_rows, last_dim],
+            dtype: DType::BF16,
+            device: device.clone(),
+        };
+        let y = GpuTensor::zeros(device.clone(), vec![n_rows, last_dim], DType::BF16)?;
+        self.kernels.call(kernel_name, &[&x_2d, &w_f32, &y])
+            .with_context(|| format!("rmsnorm kernel {} failed", kernel_name))?;
+
+        Ok(GpuTensor {
+            slice: y.slice,
+            shape,
+            dtype: DType::BF16,
+            device,
+        })
     }
 
     fn head_forward(&self, h: &GpuTensor) -> Result<GpuTensor> {
         let seqlen = h.shape[1];
         let dim = self.config.hidden_size;
         let vocab = self.config.vocab_size;
+        let device = h.device.clone();
+        let bsz = h.shape[0];
 
-        let h_host = h.to_host()?;
-        let h_f32: &[f32] = bytemuck::cast_slice(&h_host.data);
-        let offset = if seqlen > 1 { (seqlen - 1) * dim } else { 0 };
-        let last_row = &h_f32[offset..offset + dim];
+        // 检查 head_weight_gpu 是否可用（shape=[0] 表示上传失败，回退 CPU）
+        let gpu_available = self.head_weight_gpu.shape[0] == vocab;
 
-        let w_f32: &[f32] = bytemuck::cast_slice(&self.head_weight_cpu.data);
+        if gpu_available {
+            // GPU 路径: cuBLAS FP32 GEMM (head_weight_gpu 是 FP32)
+            let h_f32 = self.cast_to_f32(h)?;
 
-        let mut logits_all = vec![0.0f32; vocab];
-        let chunk_size = 4096;
-        for chunk_start in (0..vocab).step_by(chunk_size) {
-            let chunk_end = (chunk_start + chunk_size).min(vocab);
-            for r in chunk_start..chunk_end {
-                let row_off = r * dim;
-                let mut dot = 0.0f32;
-                for d in 0..dim {
-                    dot += last_row[d] * w_f32[row_off + d];
+            let h_last = if seqlen > 1 {
+                let h_host = h_f32.to_host()?;
+                let row_bytes = dim * 4; // FP32
+                let offset = (seqlen - 1) * row_bytes;
+                let mut last_row = vec![0u8; bsz * row_bytes];
+                for b in 0..bsz {
+                    let src_off = b * seqlen * row_bytes + offset;
+                    let dst_off = b * row_bytes;
+                    last_row[dst_off..dst_off + row_bytes]
+                        .copy_from_slice(&h_host.data[src_off..src_off + row_bytes]);
                 }
-                logits_all[r] = dot;
-            }
-        }
+                let cpu = CpuTensor::new(last_row, vec![bsz, dim], DType::FP32);
+                GpuTensor::from_host(device.clone(), &cpu)?
+            } else {
+                GpuTensor { slice: h_f32.slice.clone(), shape: vec![bsz, dim], dtype: DType::FP32, device: device.clone() }
+            };
 
-        let logits_bytes: Vec<u8> = bytemuck::cast_slice(&logits_all).to_vec();
-        let logits_cpu = CpuTensor::new(logits_bytes, vec![1, 1, vocab], DType::FP32);
+            let mut logits = GpuTensor::zeros(device, vec![bsz, vocab], DType::FP32)?;
+            self.cublas.gemm_f32(bsz, vocab, dim, &h_last, &self.head_weight_gpu, &mut logits, 1.0, 0.0)?;
 
-        if std::env::var("DS4RS_DEBUG_LOGITS").is_ok() {
-            let mut indexed: Vec<(usize, f32)> = logits_all.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-            eprintln!("[debug] top-5 logits:");
-            for (i, &(tid, score)) in indexed.iter().take(5).enumerate() {
-                eprintln!("  #{}: token={} score={:.4}", i, tid, score);
+            // Debug logits
+            {
+                let logits_host = logits.to_host()?;
+                let logits_f32: &[f32] = bytemuck::cast_slice(&logits_host.data);
+                let mut indexed: Vec<(usize, f32)> = logits_f32.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+                static COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+                let c = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c < 3 || std::env::var("DS4RS_DEBUG_LOGITS").is_ok() {
+                    let n = if std::env::var("DS4RS_DEBUG_LOGITS").is_ok() { 5 } else { 3 };
+                    eprintln!("[logits GPU #{}] top-{}: {:?}", c, n, &indexed[..n.min(indexed.len())]);
+                }
             }
+
+            Ok(GpuTensor { slice: logits.slice, shape: vec![1, 1, vocab], dtype: DType::FP32, device: logits.device })
         } else {
-            let mut indexed: Vec<(usize, f32)> = logits_all.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-            static COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-            let c = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if c < 3 {
-                eprintln!("[logits #{}] top-3: {:?}", c, &indexed[..3]);
-            }
-        }
+            // CPU 回退: head_weight 上传 GPU 失败时使用
+            let h_host = h.to_host()?;
+            let h_f32: &[f32] = bytemuck::cast_slice(&h_host.data);
+            let offset = if seqlen > 1 { (seqlen - 1) * dim } else { 0 };
+            let last_row = &h_f32[offset..offset + dim];
+            let w_f32: &[f32] = bytemuck::cast_slice(&self.head_weight_cpu.data);
 
-        GpuTensor::from_host(self.device.clone(), &logits_cpu)
+            let mut logits_all = vec![0.0f32; vocab];
+            let chunk_size = 4096;
+            for chunk_start in (0..vocab).step_by(chunk_size) {
+                let chunk_end = (chunk_start + chunk_size).min(vocab);
+                for r in chunk_start..chunk_end {
+                    let row_off = r * dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..dim {
+                        dot += last_row[d] * w_f32[row_off + d];
+                    }
+                    logits_all[r] = dot;
+                }
+            }
+
+            {
+                let mut indexed: Vec<(usize, f32)> = logits_all.iter().cloned().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+                static COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+                let c = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c < 3 || std::env::var("DS4RS_DEBUG_LOGITS").is_ok() {
+                    let n = if std::env::var("DS4RS_DEBUG_LOGITS").is_ok() { 5 } else { 3 };
+                    eprintln!("[logits CPU #{}] top-{}: {:?}", c, n, &indexed[..n.min(indexed.len())]);
+                }
+            }
+
+            let logits_bytes: Vec<u8> = bytemuck::cast_slice(&logits_all).to_vec();
+            let logits_cpu = CpuTensor::new(logits_bytes, vec![1, 1, vocab], DType::FP32);
+            GpuTensor::from_host(self.device.clone(), &logits_cpu)
+        }
     }
 }
