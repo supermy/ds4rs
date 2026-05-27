@@ -154,6 +154,7 @@ def prequant_iq2xs(
     progress_interval: int = 10,
     use_gpu_flag: bool = False,
     batch_size: int = 0,
+    imatrix_path: str = "",
 ) -> None:
     """预量化所有专家权重为 IQ2_XS 归档。"""
     # 量化方式优先级: CUDA > C CPU
@@ -190,6 +191,36 @@ def prequant_iq2xs(
     print(f"输入: {ckpt_path}")
     print(f"输出: {output_path}")
     print(f"量化方式: {quant_mode}")
+    print(f"imatrix: {imatrix_path or '(无)'}")
+
+    # 加载 imatrix
+    imatrix_data = {}
+    if imatrix_path and os.path.exists(imatrix_path):
+        import struct as _struct
+        if imatrix_path.endswith('.dat'):
+            with open(imatrix_path, 'rb') as f:
+                n_entries = _struct.unpack('<I', f.read(4))[0]
+                print(f"[imatrix] 加载 {n_entries} 个条目")
+                for i in range(n_entries):
+                    name_len = _struct.unpack('<I', f.read(4))[0]
+                    name = f.read(name_len).decode('utf-8')
+                    n_dims = _struct.unpack('<I', f.read(4))[0]
+                    dims = []
+                    for _ in range(n_dims):
+                        dim = _struct.unpack('<I', f.read(4))[0]
+                        dims.append(dim)
+                    n_elements = 1
+                    for d in dims:
+                        n_elements *= d
+                    data = np.frombuffer(f.read(n_elements * 4), dtype=np.float32).copy()
+                    imatrix_data[name] = data
+                    if (i + 1) % 20 == 0:
+                        print(f"\r  [imatrix] 已加载 {i+1}/{n_entries}", end='', flush=True)
+                print()
+        else:
+            data = np.load(imatrix_path)
+            imatrix_data = {k: data[k] for k in data.files}
+        print(f"[imatrix] 加载完成: {len(imatrix_data)} 个张量")
 
     # 扫描专家权重
     print("\n[扫描] 查找专家权重...")
@@ -319,6 +350,23 @@ def prequant_iq2xs(
                     del scale_scales, scale_gpu, scale_expanded
 
                 b.f32_gpu = decoded
+
+                # 应用 imatrix 加权（量化前对权重加权，使量化误差在重要权重上最小化）
+                if imatrix_data:
+                    for i, (lid, eid, wn, _) in enumerate(expert_list):
+                        # 构建 llama.cpp 风格的 imatrix 名称
+                        imatrix_name = f"blk.{lid}.ffn_{'gate' if wn == 'w1' else 'down' if wn == 'w2' else 'up'}_exps.weight"
+                        im = imatrix_data.get(imatrix_name)
+                        if im is not None:
+                            # imatrix 是 per-row 的权重，需要扩展到每个元素
+                            row_start = i * out_dim
+                            row_end = (i + 1) * out_dim
+                            im_tensor = torch.from_numpy(im).float().cuda()
+                            # imatrix 长度 = n_blocks_per_row, 每个元素覆盖 QK_K 个权重
+                            im_expanded = im_tensor.repeat_interleave(QK_K)[:in_dim]
+                            # 对每行应用 imatrix
+                            decoded[row_start:row_end] *= im_expanded.unsqueeze(0)
+                            del im_tensor, im_expanded
 
                 # 分配输出缓冲
                 b.total_blocks = n * blocks_per_expert
@@ -563,6 +611,7 @@ def main():
     parser.add_argument("--n-experts", type=int, default=0, help="每层专家数（0=自动检测）")
     parser.add_argument("--use-gpu", action="store_true", help="使用 GPU 加速量化")
     parser.add_argument("--batch-size", type=int, default=0, help="批量大小（0=自动）")
+    parser.add_argument("--imatrix", type=str, default="", help="importance weights 文件路径 (.dat 或 .npz)")
     args = parser.parse_args()
 
     output_path = args.output
@@ -572,7 +621,8 @@ def main():
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     prequant_iq2xs(args.ckpt_path, output_path, args.n_layers, args.n_experts,
-                   use_gpu_flag=args.use_gpu, batch_size=args.batch_size)
+                   use_gpu_flag=args.use_gpu, batch_size=args.batch_size,
+                   imatrix_path=args.imatrix)
 
 
 if __name__ == "__main__":

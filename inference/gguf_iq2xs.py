@@ -57,11 +57,15 @@ GGUF_TYPE_FLOAT64 = 12
 
 # GGML 类型 (仅定义需要的)
 GGML_TYPE_F16 = 1
-GGML_TYPE_IQ2_XS = 28  # llama.cpp 中的定义
+GGML_TYPE_Q2_K = 10
+GGML_TYPE_IQ2_XXS = 16
+GGML_TYPE_IQ2_XS = 28
 
-# IQ2_XS block 大小
-IQ2_XS_BLOCK_SIZE = 256  # 每个block 256 个元素
-IQ2_XS_BLOCK_BYTES = 74  # 每个block 74 字节 (d:2 + qs:64 + scales:8)
+# block 大小
+IQ2_XS_BLOCK_SIZE = 256
+IQ2_XS_BLOCK_BYTES = 74
+IQ2_XXS_BLOCK_BYTES = 66
+Q2_K_BLOCK_BYTES = 84
 
 
 def _write_string(f: BinaryIO, s: str) -> None:
@@ -107,6 +111,10 @@ class GGUFTensorInfo:
         """张量数据大小（字节）。"""
         if self.ggml_type == GGML_TYPE_IQ2_XS:
             return self.n_blocks() * IQ2_XS_BLOCK_BYTES
+        elif self.ggml_type == GGML_TYPE_IQ2_XXS:
+            return self.n_blocks() * IQ2_XXS_BLOCK_BYTES
+        elif self.ggml_type == GGML_TYPE_Q2_K:
+            return self.n_blocks() * Q2_K_BLOCK_BYTES
         elif self.ggml_type == GGML_TYPE_F16:
             return self.n_elements() * 2
         else:
@@ -114,14 +122,36 @@ class GGUFTensorInfo:
 
 
 class GGUFWriter:
-    """GGUF 文件写入器（简化版，仅支持 IQ2_XS）。"""
+    """GGUF 文件写入器 — 增量写入，避免内存爆炸。
+    
+    数据增量写入临时文件，元数据（张量索引）在内存中累积（很小），
+    最终组装完整 GGUF 文件。
+    """
     
     def __init__(self, alignment: int = GGUF_DEFAULT_ALIGNMENT):
         self.alignment = alignment
-        self.kv_pairs: Dict[str, Tuple[int, bytes]] = {}  # key -> (type, value)
+        self.kv_pairs: Dict[str, Tuple[int, bytes]] = {}
         self.tensors: List[GGUFTensorInfo] = []
-        self.tensor_data: Dict[str, bytes] = {}  # name -> data
         self._current_data_offset = 0
+        # 增量写入：数据直接写临时文件
+        self._data_file = None
+        self._data_filepath = None
+    
+    def _ensure_data_file(self):
+        if self._data_file is None:
+            import tempfile
+            self._data_filepath = tempfile.mktemp(suffix=".gguf.data.tmp")
+            self._data_file = open(self._data_filepath, 'wb')
+    
+    def _write_tensor_data(self, data: bytes):
+        """增量写入张量数据到临时文件。"""
+        self._ensure_data_file()
+        self._data_file.write(data)
+        self._current_data_offset += len(data)
+        padding = (self.alignment - (len(data) % self.alignment)) % self.alignment
+        if padding:
+            self._data_file.write(b'\x00' * padding)
+            self._current_data_offset += padding
     
     def set_kv_string(self, key: str, value: str) -> None:
         """设置字符串 KV 对。"""
@@ -170,37 +200,108 @@ class GGUFWriter:
         )
         
         self.tensors.append(tensor_info)
-        self.tensor_data[name] = bytes(data)
+        self._write_tensor_data(data)
+    
+    def add_iq2xxs_tensor(self, name: str, d: np.ndarray, qs: np.ndarray, dims: List[int]) -> None:
+        """添加 IQ2_XXS 张量。
+        
+        参数:
+            name: 张量名称
+            d: float16 数组, 形状 [n_blocks]
+            qs: uint16 数组, 形状 [n_blocks, 32]
+            dims: 原始形状 [out_dim, in_dim]
+        """
+        n_blocks = d.size
+        
+        d_flat = d.ravel().astype(np.float16)
+        qs_flat = qs.reshape(n_blocks, 32).astype(np.uint16)
+        
+        block_arr = np.zeros((n_blocks, IQ2_XXS_BLOCK_BYTES), dtype=np.uint8)
+        block_arr[:, 0:2] = d_flat.view(np.uint8).reshape(n_blocks, 2)
+        block_arr[:, 2:66] = qs_flat.view(np.uint8).reshape(n_blocks, 64)
+        data = block_arr.tobytes()
+        
+        tensor_info = GGUFTensorInfo(
+            name=name,
+            dims=dims,
+            ggml_type=GGML_TYPE_IQ2_XXS,
+            offset=self._current_data_offset,
+        )
+        
+        self.tensors.append(tensor_info)
+        self._write_tensor_data(data)
         self._current_data_offset += len(data)
         
-        # 对齐到 32 字节
+        padding = (self.alignment - (len(data) % self.alignment)) % self.alignment
+        self._current_data_offset += padding
+    
+    def add_q2k_tensor(self, name: str, d: np.ndarray, dmin: np.ndarray, 
+                       scales: np.ndarray, qs: np.ndarray, dims: List[int]) -> None:
+        """添加 Q2_K 张量。
+        
+        参数:
+            name: 张量名称
+            d: float16 数组, 形状 [n_blocks] — super-block scale
+            dmin: float16 数组, 形状 [n_blocks] — minimum scale
+            scales: uint8 数组, 形状 [n_blocks, 16] — 子块缩放
+            qs: uint8 数组, 形状 [n_blocks, 64] — 2-bit 量化值
+            dims: 原始形状 [out_dim, in_dim]
+        """
+        n_blocks = d.size
+        
+        d_flat = d.ravel().astype(np.float16)
+        dmin_flat = dmin.ravel().astype(np.float16)
+        scales_flat = scales.reshape(n_blocks, 16).astype(np.uint8)
+        qs_flat = qs.reshape(n_blocks, 64).astype(np.uint8)
+        
+        block_arr = np.zeros((n_blocks, Q2_K_BLOCK_BYTES), dtype=np.uint8)
+        block_arr[:, 0:2] = d_flat.view(np.uint8).reshape(n_blocks, 2)
+        block_arr[:, 2:4] = dmin_flat.view(np.uint8).reshape(n_blocks, 2)
+        block_arr[:, 4:20] = scales_flat
+        block_arr[:, 20:84] = qs_flat
+        data = block_arr.tobytes()
+        
+        tensor_info = GGUFTensorInfo(
+            name=name,
+            dims=dims,
+            ggml_type=GGML_TYPE_Q2_K,
+            offset=self._current_data_offset,
+        )
+        
+        self.tensors.append(tensor_info)
+        self._write_tensor_data(data)
+        self._current_data_offset += len(data)
+        
         padding = (self.alignment - (len(data) % self.alignment)) % self.alignment
         self._current_data_offset += padding
     
     def write(self, filepath: str) -> None:
-        """写入 GGUF 文件。"""
+        """写入 GGUF 文件（合并元数据 + 临时数据文件）。"""
+        # 关闭数据临时文件
+        if self._data_file is not None:
+            self._data_file.close()
+        
         n_tensors = len(self.tensors)
         n_kv = len(self.kv_pairs)
         
         # 计算元数据大小
         meta_size = 4 + 4 + 8 + 8  # magic + version + n_tensors + n_kv
         
-        # KV 对大小
         for key, (kv_type, value) in self.kv_pairs.items():
-            meta_size += 8 + len(key.encode("utf-8"))  # key
-            meta_size += 4  # type
-            meta_size += len(value)  # value
+            meta_size += 8 + len(key.encode("utf-8"))
+            meta_size += 4
+            meta_size += len(value)
         
-        # 张量信息大小
         for tensor in self.tensors:
-            meta_size += 8 + len(tensor.name.encode("utf-8"))  # name
-            meta_size += 4  # n_dims
-            meta_size += 8 * len(tensor.dims)  # dims
-            meta_size += 4  # type
-            meta_size += 8  # offset
+            meta_size += 8 + len(tensor.name.encode("utf-8"))
+            meta_size += 4
+            meta_size += 8 * len(tensor.dims)
+            meta_size += 4
+            meta_size += 8
         
-        # 数据区偏移（对齐）
         data_offset = (meta_size + self.alignment - 1) // self.alignment * self.alignment
+        
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         
         with open(filepath, "wb") as f:
             # 文件头
@@ -227,10 +328,15 @@ class GGUFWriter:
             # 填充到数据区
             _pad_to_alignment(f, self.alignment)
             
-            # 张量数据
-            for tensor in self.tensors:
-                f.write(self.tensor_data[tensor.name])
-                _pad_to_alignment(f, self.alignment)
+            # 数据区：从临时文件拷贝
+            if self._data_filepath and os.path.exists(self._data_filepath):
+                with open(self._data_filepath, 'rb') as df:
+                    while True:
+                        chunk = df.read(64 * 1024 * 1024)  # 64MB chunks
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                os.remove(self._data_filepath)
         
         total_size = os.path.getsize(filepath)
         print(f"[GGUF] 写入完成: {filepath}")

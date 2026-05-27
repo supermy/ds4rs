@@ -22,6 +22,7 @@ _CONFIG_KEY_MAP = {
     "num_attention_heads": "n_heads",
     "num_experts_per_tok": "n_activated_experts",
     "num_nextn_predict_layers": "n_mtp_layers",
+    "num_hash_layers": "n_hash_layers",
     "qk_rope_head_dim": "rope_head_dim",
     "rms_norm_eps": "norm_eps",
     "routed_scaling_factor": "route_scale",
@@ -457,14 +458,25 @@ def _load_activated_experts(moe, activated_indices: list) -> None:
 
     cpu_runner = moe._cpu_expert_runner
 
+    # IQ2_XXS+Q2_K 模式：所有专家走 CPU FFN，跳过 GPU 缓存
+    if cpu_runner is not None and cpu_runner._mixed_pool is not None:
+        for expert_id in activated_indices:
+            if expert_id < len(moe.experts):
+                moe.experts[expert_id] = None
+        return
+
     # === 阶段 0：统一频率统计 — 所有激活专家都计数 ===
     # 无论走 GPU 还是 CPU，Gate 选中就记录频率
-    # 这是预取排序的唯一数据源
-    if cpu_runner is not None and hasattr(cpu_runner, '_rust_runner') and cpu_runner._rust_runner is not None:
-        for expert_id in activated_indices:
+    # 这是预取排序的唯一数据源（Rust freq + Python _access_freq + _layer_freq）
+    for expert_id in activated_indices:
+        # Rust SLRU freq（唯一入口，驱动 CPU 侧预取排序）
+        if cpu_runner is not None and hasattr(cpu_runner, '_rust_runner') and cpu_runner._rust_runner is not None:
             cpu_runner._rust_runner.record_access(layer_id, expert_id)
             cpu_runner._access_freq[(layer_id, expert_id)] = \
                 cpu_runner._access_freq.get((layer_id, expert_id), 0) + 1
+        # GPU SLRU _layer_freq（驱动 GPU 侧 warmup 和预取排序）
+        # 此处统一递增，不再依赖 get_expert_gpu_params 中的 _record_access
+        cache._record_access(layer_id, expert_id)
 
     # === 阶段 1：识别 GPU 命中 / 差集 ===
     gpu_hit_ids = []
@@ -480,11 +492,7 @@ def _load_activated_experts(moe, activated_indices: list) -> None:
             cpu_ffn_ids.append(expert_id)
 
     # === 阶段 2：处理 GPU 缓存命中的专家 ===
-    for expert_id in gpu_hit_ids:
-        with torch.device('cpu'):
-            moe._ensure_expert(expert_id)
-
-    # GPU 命中的专家：获取 GPU 参数
+    # GPU 命中的专家：创建空壳 + 获取 GPU 参数
     all_gpu_params = {}
     for expert_id in gpu_hit_ids:
         with torch.device('cpu'):
@@ -520,33 +528,39 @@ def _unload_activated_experts(moe, activated_indices: list) -> None:
     pass
 
 
-def sample(logits, temperature: float = 1.0):
+def sample(logits, temperature: float = 1.0, top_p: float = 1.0, min_p: float = 0.0):
     """
-    基于 Gumbel-max 技巧的采样函数。
-
-    原理：
-        对 logits 施加温度缩放后计算 softmax 得到概率分布，
-        再为每个概率值采样一个服从指数分布 Exponential(1) 的随机变量，
-        取概率除以该随机变量后的最大值对应的索引作为采样结果。
-
-        数学上等价于从多项分布 (multinomial) 中采样，但完全在 GPU 上完成，
-        避免了 torch.multinomial 将数据从 GPU 同步回 CPU 的开销，
-        因此在批量推理场景下速度更快。
+    基于 Gumbel-max 技巧的采样函数，支持 top_p (nucleus) 和 min_p 过滤。
 
     参数：
         logits: 模型输出的原始 logits，形状通常为 (batch_size, vocab_size)。
         temperature: 温度参数，控制采样随机性。
-            - temperature -> 0 时趋近于贪心采样（取概率最大的 token）。
-            - temperature = 1 时为标准随机采样。
-            - temperature > 1 时分布更平坦，随机性增强；
-            - temperature < 1 时分布更尖锐，随机性减弱。
-            此处通过 max(temperature, 1e-5) 避免除零错误。
+        top_p: nucleus sampling 阈值，只保留累积概率 >= top_p 的最小 token 集合。
+               top_p=1.0 表示不过滤。
+        min_p: 最小概率阈值，只保留概率 >= min_p * max_prob 的 token。
+               min_p=0.0 表示不过滤。
 
     返回：
         采样得到的 token 索引，形状与 logits 的前缀维度一致。
     """
     logits = logits / max(temperature, 1e-5)
     probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+
+    # min_p 过滤：只保留概率 >= min_p * max_prob 的 token
+    if min_p > 0.0:
+        max_probs = probs.max(dim=-1, keepdim=True).values
+        probs[probs < min_p * max_probs] = 0
+        probs.div_(probs.sum(dim=-1, keepdim=True).clamp(min=1e-10))
+
+    # top_p (nucleus) 过滤
+    if top_p < 1.0:
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        remove_mask = cumulative_probs - sorted_probs > top_p
+        sorted_probs[remove_mask] = 0
+        sorted_probs.div_(sorted_probs.sum(dim=-1, keepdim=True).clamp(min=1e-10))
+        probs.scatter_(dim=-1, index=sorted_indices, src=sorted_probs)
+
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
 
@@ -556,8 +570,11 @@ def generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
-) -> List[List[int]]:
+    temperature: float = 1.0,
+    repetition_penalty: float = 1.0,
+    top_p: float = 1.0,
+    min_p: float = 0.0
+) -> tuple[List[List[int]], dict]:
     """
     批量文本生成函数，支持 left-pad（左填充）对齐的变长 prompt。
 
@@ -588,8 +605,18 @@ def generate(
         temperature: 采样温度，传递给 sample() 函数控制随机性。
 
     返回：
-        每个序列的生成结果 token 列表，已截断至 eos_id 之前，并在末尾追加 eos_id。
+        (completion_tokens, stats) 元组：
+        - completion_tokens: 每个序列的生成结果 token 列表
+        - stats: 推理统计信息字典，包含 tokens_per_sec, gpu_peak_mb, cpu_peak_mb 等
     """
+    import time as _time
+    gen_start = _time.time()
+    torch.cuda.reset_peak_memory_stats()
+    try:
+        import resource
+        cpu_start = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        cpu_start = 0
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
     # total_len 为实际需要进行 forward 计算的最大序列长度，
@@ -621,8 +648,29 @@ def generate(
         t0 = __import__('time').time()
         logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
         fwd_ms = (__import__('time').time() - t0) * 1000
+
+        # DEBUG: 打印第一个生成位置的 logits 分布
+        if cur_pos == min(prompt_lens):
+            _l = logits[0]
+            print(f"[DEBUG] logits: shape={_l.shape}, range=[{_l.min():.4f}, {_l.max():.4f}], mean={_l.mean():.4f}, std={_l.std():.4f}", flush=True)
+            _top5_vals, _top5_ids = _l.topk(10)
+            print(f"[DEBUG] top-10 ids: {_top5_ids.tolist()}", flush=True)
+            print(f"[DEBUG] top-10 vals: {_top5_vals.tolist()}", flush=True)
+            _has_nan = torch.isnan(_l).sum().item()
+            _has_inf = torch.isinf(_l).sum().item()
+            print(f"[DEBUG] NaN: {_has_nan}, Inf: {_has_inf}", flush=True)
+
+        # Repetition penalty：对已生成的 token 施加惩罚
+        if repetition_penalty > 1.0:
+            for b in range(tokens.shape[0]):
+                plen = prompt_lens[b]
+                if cur_pos > plen:
+                    generated = tokens[b, plen:cur_pos]
+                    unique_ids = generated.unique()
+                    logits[b, unique_ids] /= repetition_penalty
+
         if temperature > 0:
-            next_token = sample(logits, temperature)
+            next_token = sample(logits, temperature, top_p, min_p)
         else:
             next_token = logits.argmax(dim=-1)
         # 如果当前位置属于原始 prompt，则使用 prompt 中的 ground-truth token 覆盖模型预测值。
@@ -661,6 +709,7 @@ def generate(
         if finished.all():
             break
     completion_tokens = []
+    total_completion_tokens = 0
     for i, toks in enumerate(tokens.tolist()):
         # 截取 prompt 之后、最多 max_new_tokens 个生成 token。
         toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
@@ -670,7 +719,80 @@ def generate(
         # 在结果末尾追加 eos_id，保证输出格式统一。
         toks.append(eos_id)
         completion_tokens.append(toks)
-    return completion_tokens
+        total_completion_tokens += len(toks) - 1  # 减去 eos_id
+
+    # 收集统计信息
+    gen_elapsed = _time.time() - gen_start
+    gpu_peak_mb = torch.cuda.max_memory_allocated() / (1024**2)
+    try:
+        import resource
+        cpu_peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        cpu_peak_mb = cpu_peak_kb / 1024 if cpu_peak_kb > cpu_start else 0
+    except Exception:
+        cpu_peak_mb = 0
+
+    stats = {
+        "tokens_per_sec": total_completion_tokens / gen_elapsed if gen_elapsed > 0 else 0,
+        "total_tokens": total_completion_tokens,
+        "elapsed_sec": gen_elapsed,
+        "gpu_peak_mb": gpu_peak_mb,
+        "cpu_peak_mb": cpu_peak_mb,
+    }
+    return completion_tokens, stats
+
+
+def _run_inference_loop(model, tokenizer, interactive, input_file,
+                        max_new_tokens, temperature, repetition_penalty,
+                        top_p, min_p, quant_type):
+    """IQ2_XXS+Q2_K 模式的推理循环：所有专家走 CPU FFN。"""
+    # IQ2_XXS+Q2_K 推荐参数
+    if temperature == 1.0:
+        temperature = 0.6
+    if top_p == 1.0:
+        top_p = 0.95
+    if min_p == 0.0:
+        min_p = 0.01
+    print(f"[IQ2_XXS+Q2_K] temperature={temperature}, top_p={top_p}, min_p={min_p}")
+
+    if interactive:
+        messages = []
+        while True:
+            try:
+                prompt = input(">>> ")
+            except EOFError:
+                break
+            if prompt == "/exit":
+                break
+            elif prompt == "/clear":
+                messages.clear()
+                continue
+            messages.append({"role": "user", "content": prompt})
+            prompt_tokens = tokenizer.encode(encode_messages(messages, thinking_mode="chat"))
+            with torch.inference_mode():
+                completion_tokens, stats = generate(
+                    model, [prompt_tokens], max_new_tokens,
+                    tokenizer.eos_token_id, temperature,
+                    repetition_penalty, top_p, min_p)
+            completion = tokenizer.decode(completion_tokens[0])
+            print(completion)
+            print(f"\n[stats] {stats['total_tokens']} tokens in {stats['elapsed_sec']:.2f}s → {stats['tokens_per_sec']:.1f} t/s")
+            messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
+    else:
+        with open(input_file) as f:
+            prompts = f.read().split("\n\n")
+        prompt_tokens = [tokenizer.encode(encode_messages([{"role": "user", "content": prompt}], thinking_mode="chat")) for prompt in prompts]
+        with torch.inference_mode():
+            completion_tokens, stats = generate(
+                model, prompt_tokens, max_new_tokens,
+                tokenizer.eos_token_id, temperature,
+                repetition_penalty, top_p, min_p)
+        completions = tokenizer.batch_decode(completion_tokens)
+        for prompt, completion, ctoks in zip(prompts, completions, completion_tokens):
+            print("Prompt:", prompt)
+            print("Completion:", completion)
+            print("Completion tokens[:30]:", ctoks[:30])
+            print()
+        print(f"[stats] {stats['total_tokens']} tokens in {stats['elapsed_sec']:.2f}s → {stats['tokens_per_sec']:.1f} t/s")
 
 
 def main(
@@ -682,6 +804,10 @@ def main(
     temperature: float = 1.0,
     quant_type: str = "fp4",
     iq2xs_dir: str = "",
+    repetition_penalty: float = 1.0,
+    top_p: float = 1.0,
+    min_p: float = 0.0,
+    gguf_path: str = "",
 ) -> None:
     """
     文本生成主入口函数，负责分布式环境初始化、模型加载、以及交互式/批处理推理。
@@ -747,6 +873,13 @@ def main(
         raw_config.setdefault("dtype", "fp8" if fmt in ("e4m3", "fp8") else "bf16")
         raw_config.setdefault("scale_fmt", qc.get("scale_fmt", "ue8m0"))
         raw_config.setdefault("scale_dtype", qc.get("scale_dtype", "fp8"))
+
+    # 提取 rope_scaling 嵌套参数
+    if "rope_scaling" in raw_config:
+        rs = raw_config.pop("rope_scaling")
+        raw_config.setdefault("rope_factor", rs.get("factor", 40))
+        raw_config.setdefault("beta_fast", rs.get("beta_fast", 32))
+        raw_config.setdefault("beta_slow", rs.get("beta_slow", 1))
 
     mapped = {}
     valid_fields = {f.name for f in ModelArgs.__dataclass_fields__.values()}
@@ -826,6 +959,25 @@ def main(
             
             print(f"[IQ2_XS] Pre-quantization complete, using archive: {archive_path}")
             os.environ["IQ2XS_DIR"] = iq2xs_output_dir
+    elif quant_type == "iq2xxs_q2k":
+        # IQ2_XXS+Q2_K 混合量化：从 GGUF 文件加载
+        if not gguf_path:
+            candidate_paths = [
+                "/workspace/gguf/experts_iq2xxs_q2k.gguf",
+                os.path.join(ckpt_path, "experts_iq2xxs_q2k.gguf"),
+                os.path.expanduser("~/.cache/ds4rs/experts_iq2xxs_q2k.gguf"),
+            ]
+            for p in candidate_paths:
+                if os.path.exists(p):
+                    gguf_path = p
+                    break
+        if not gguf_path or not os.path.exists(gguf_path):
+            raise FileNotFoundError(
+                f"GGUF file not found for iq2xxs_q2k mode. "
+                f"Specify --gguf-path or place experts_iq2xxs_q2k.gguf in one of: {candidate_paths}"
+            )
+        print(f"[IQ2_XXS+Q2_K] Using GGUF: {gguf_path}")
+        os.environ["IQ2XS_DIR"] = ""  # 不使用 IQ2_XS 归档
     else:
         os.environ["IQ2XS_DIR"] = ""
 
@@ -859,6 +1011,22 @@ def main(
     # 自动 warmup：做一次短推理收集 LFU 统计，然后将热点专家常驻 GPU
     # 必须在 torch.set_default_device("cuda") 之后，因为模型内部创建的索引张量需要在 GPU 上
     expert_cache = getattr(model, '_expert_cache', None)
+
+    # IQ2_XXS+Q2_K 混合量化：初始化 MixedQuantExpertPool，所有专家走 CPU FFN
+    if quant_type == "iq2xxs_q2k":
+        from rust_cpu_expert import MixedQuantExpertPool
+        mixed_pool = MixedQuantExpertPool(gguf_path)
+        cpu_runner = getattr(model, '_cpu_expert_runner', None)
+        if cpu_runner is not None:
+            cpu_runner.set_mixed_pool(mixed_pool)
+            print(f"[IQ2_XXS+Q2_K] Mixed pool initialized, all experts → CPU FFN")
+        # 跳过 GPU 缓存 warmup，所有专家走 CPU
+        print("I'm DeepSeek 👋")
+        _run_inference_loop(model, tokenizer, interactive, input_file,
+                           max_new_tokens, temperature, repetition_penalty,
+                           top_p, min_p, quant_type)
+        return
+
     if expert_cache is not None:
         # IQ2_XS: 延迟打开归档（常驻权重已加载完，页缓存不再竞争）
         if iq2xs_dir:
@@ -872,6 +1040,10 @@ def main(
         # IQ2_XS 归档加载（跳过 CPU SLRU，归档通过 mmap 按需读取）
         if iq2xs_dir:
             expert_cache.load_iq2xs_to_cpu()
+        # 从 Rust freq 恢复 Python _access_freq（热重启后 Python 端频率为空）
+        cpu_runner = getattr(model, '_cpu_expert_runner', None)
+        if cpu_runner is not None:
+            cpu_runner.restore_access_freq_from_rust()
         if cache_loaded and total_freq:
             print("[Warmup] Hot restart: using persisted LFU stats, skipping inference warmup")
             expert_cache.warmup_from_cache(model)
@@ -931,20 +1103,23 @@ def main(
                 continue
             messages.append({"role": "user", "content": prompt})
             prompt_tokens = tokenizer.encode(encode_messages(messages, thinking_mode="chat"))
-            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+            completion_tokens, stats = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature, repetition_penalty, top_p, min_p)
             completion = tokenizer.decode(completion_tokens[0])
             print(completion)
+            print(f"\n[stats] {stats['total_tokens']} tokens in {stats['elapsed_sec']:.2f}s → {stats['tokens_per_sec']:.1f} t/s | GPU peak: {stats['gpu_peak_mb']:.0f}MB | CPU peak: {stats['cpu_peak_mb']:.0f}MB")
             messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
     else:
         with open(input_file) as f:
             prompts = f.read().split("\n\n")
         prompt_tokens = [tokenizer.encode(encode_messages([{"role": "user", "content": prompt}], thinking_mode="chat")) for prompt in prompts]
-        completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
+        completion_tokens, stats = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature, repetition_penalty, top_p, min_p)
         completions = tokenizer.batch_decode(completion_tokens)
-        for prompt, completion in zip(prompts, completions):
+        for prompt, completion, ctoks in zip(prompts, completions, completion_tokens):
             print("Prompt:", prompt)
             print("Completion:", completion)
+            print("Completion tokens[:30]:", ctoks[:30])
             print()
+        print(f"[stats] {stats['total_tokens']} tokens in {stats['elapsed_sec']:.2f}s → {stats['tokens_per_sec']:.1f} t/s | GPU peak: {stats['gpu_peak_mb']:.0f}MB | CPU peak: {stats['cpu_peak_mb']:.0f}MB")
 
     expert_cache = getattr(model, '_expert_cache', None)
     if expert_cache is not None:
@@ -962,11 +1137,20 @@ if __name__ == "__main__":
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--quant-type", type=str, default="fp4", choices=["fp4", "iq2xs"],
-                        help="量化类型：fp4（默认）或 iq2xs")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Repetition penalty (>1.0 惩罚重复 token，推荐 1.1-1.5)")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="Top-p (nucleus) sampling 阈值")
+    parser.add_argument("--min-p", type=float, default=0.0,
+                        help="Min-p sampling 阈值，只保留概率 >= min_p * max_prob 的 token")
+    parser.add_argument("--quant-type", type=str, default="fp4", choices=["fp4", "iq2xs", "iq2xxs_q2k"],
+                        help="量化类型：fp4（默认）、iq2xs 或 iq2xxs_q2k")
     parser.add_argument("--iq2xs-dir", type=str, default="",
                         help="IQ2_XS 量化文件目录（为空则自动检测）")
+    parser.add_argument("--gguf-path", type=str, default="",
+                        help="IQ2_XXS+Q2_K GGUF 文件路径（iq2xxs_q2k 模式）")
     args = parser.parse_args()
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, 
-         args.max_new_tokens, args.temperature, args.quant_type, args.iq2xs_dir)
+    main(args.ckpt_path, args.config, args.input_file, args.interactive,
+         args.max_new_tokens, args.temperature, args.quant_type, args.iq2xs_dir,
+         args.repetition_penalty, args.top_p, args.min_p, args.gguf_path)

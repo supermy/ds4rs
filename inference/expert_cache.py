@@ -728,8 +728,8 @@ class ExpertCache:
     # head logits ~256MB + 碎片 ~200MB = ~800MB
     # 但 mem_get_info() 返回的 free 已扣除模型常驻，所以只需预留推理 buffer
     VRAM_RESERVE_MB = 800
-    # 计算开销：GEMM workspace + 临时张量
-    VRAM_COMPUTE_OVERHEAD_MB = 100
+    # 计算开销：GEMM workspace + 临时张量 + head logits 分块 (~256MB)
+    VRAM_COMPUTE_OVERHEAD_MB = 400
     # IQ2_XS GEMM 计算开销：workspace + 临时张量
     IQ2_XS_VRAM_OVERHEAD_MB = 50
     CACHE_MISS_RESERVE_EXPERTS = 2
@@ -854,7 +854,7 @@ class ExpertCache:
             topk_info: 当前层激活的 (expert_id, score) 列表，用于路由预测预取
         """
         key = (layer_id, expert_id)
-        self._record_access(layer_id, expert_id)
+        # _layer_freq 已在 _load_activated_experts Phase 0 统一递增，此处不再重复
 
         # 将当前专家加入 step 保护集合（防止当前 step 内被淘汰）
         if self._step_protected_keys is not None:
@@ -1038,7 +1038,10 @@ class ExpertCache:
 
     def on_step_end(self):
         """Step 结束：清理 step 级别保护。"""
-        self._step_protected_keys = set()
+        # 保持 on_step_start 设置的启用/禁用语义
+        # None → None（禁用），set() → set()（清空但保持启用）
+        if self._step_protected_keys is not None:
+            self._step_protected_keys.clear()
 
     def prefetch_next_layer(self, current_layer: int, activated_indices: list):
         """多级异步预取流水线：GPU←PinnedPool←SSD。

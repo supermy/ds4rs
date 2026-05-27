@@ -2,6 +2,104 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.7] - 2025-05-27
+
+### CPU FFN AVX-512 内核深度优化（AMD Ryzen 5 7600 专用）
+
+#### IQ2_XXS AVX-512 内核优化
+
+- **256-bit maddubs 管线**: grid_u64 预计算表（8KB L1 常驻）+ `_mm256_set_epi64x` 打包，替代标量逐字节 grid 查表
+- **KSIGNS_IQ2XS_U64 预计算表**: 128 项 × 8 bytes = 1KB L1 常驻，将 i8 符号掩码重解释为 u64，供 `_mm256_set_epi64x` 直接使用
+- **双 ib32 融合**: 一次处理 2 个 ib32（64 个 q8 值），2 次 256-bit maddubs 结果累加后 1 次 hsum，减少 hsum 次数 50%
+- **去掉 grid 符号吸收**: 发现 IQ2_XXS grid 值全部在 [8, 43] 范围（unsigned byte），sign 只需应用到 q8，grid 直接传给 maddubs
+- **memcpy 批量读取**: `std::ptr::read_unaligned` 一次读 16 字节（8 个 u16 = 4 个 u32），替代逐个 u16 读取和拼接，减少标量解码开销
+- **scale 融入 madd**: `_mm256_madd_epi16(dot_256, sc_256)` 替代标量 `sc_val * isuml`
+
+#### Q2_K AVX-512 内核优化
+
+- **summs 256-bit 批量处理**: 16 次 128-bit 循环 → 8 次 256-bit 循环（一次处理 2 个子块），`_mm256_maddubs_epi16(_mm256_set1_epi8(1), q8_256)` 替代标量累加
+- **scale 融入 madd**: Q2_K isum 的 scale 乘法融入 `_mm256_madd_epi16`，避免标量乘法
+- **单线程 matvec**: `q2k_matvec_blocked_amd7600` 单线程顺序扫描，用于 6 专家并行场景避免 rayon 争抢
+
+#### 函数重命名（CPU 专用）
+
+AVX-512 内核函数从通用 `avx512` 后缀改为 `amd7600` 专用，后续不同 CPU 提供不同专有函数：
+
+| 原名 | 新名 |
+|------|------|
+| `iq2xxs_vec_dot_q8_avx512` | `iq2xxs_vec_dot_q8_amd7600` |
+| `iq2xxs_matvec_blocked_avx512` | `iq2xxs_matvec_blocked_amd7600` |
+| `q2k_vec_dot_q8_avx512` | `q2k_vec_dot_q8_amd7600` |
+| `q2k_matvec_blocked_avx512` | `q2k_matvec_blocked_amd7600` |
+
+#### 6 专家并行实测
+
+**结论：DDR5 带宽瓶颈下，6 专家并行不可行。**
+
+| 方案 | 6 专家耗时 | 原因 |
+|------|-----------|------|
+| 串行（基线） | 28.4ms | — |
+| 2路并行 + rayon down | 59.9ms | rayon 线程池争抢 |
+| 2路并行 + 单线程 down | 390.9ms | 单线程 down 太慢（7168行） |
+
+DDR5 带宽利用率 ~50%，多线程争抢带宽反而降低性能。顺序访问已最大化 DDR burst 效率。
+
+#### 性能提升
+
+| 阶段 | 单专家 FFN | 优化点 | 累计提升 |
+|------|-----------|--------|---------|
+| 初始（128-bit + 逐bit sign） | 7.76ms | — | — |
+| +预计算符号掩码表 | 6.75ms | KSIGNS_IQ2XS_MASKS 表 | -13% |
+| +256-bit maddubs 管线 | 6.22ms | grid_u64 表 + _mm256_set_epi64x | -20% |
+| +Q2_K scale 融入 madd | 5.88ms | _mm256_madd_epi16 替代标量乘 | -24% |
+| +去掉 grid 符号吸收 + 双 ib32 融合 | 4.66ms | grid unsigned + 2 ib32/iter | -40% |
+| +memcpy 批量读取 | 4.59ms | read_unaligned 16B | -41% |
+
+当前性能：单专家 FFN 4.59ms，6 专家串行 27.5ms，推理速度 0.76 t/s，DDR5 带宽利用率 50.5%。
+
+#### 修改文件
+
+- `src/cpu_expert/avx512.rs` - IQ2_XXS/Q2_K AVX-512 内核深度优化 + 函数重命名
+- `src/cpu_expert/tables.rs` - 新增 KSIGNS_IQ2XS_U64 常量
+- `src/cpu_expert/kernel.rs` - 调用点更新 + 6 专家并行实验
+
+## [0.9.6] - 2025-05-25
+
+### 混合量化：IQ2_XS (gate, up) + Q2_K (down)
+
+#### 混合量化脚本 (inference/prequant_mixed_iq2xxs_q2k.py)
+
+- **混合量化策略**: gate/up 投影使用 IQ2_XS (2.0625 bpw)，down 投影使用 Q2_K (2.5625 bpw)
+- **CUDA 量化**: IQ2_XS 使用 CUDA kernel 直接在 GPU 上量化 (~50-100 e/s vs C CPU ~0.3 e/s)
+- **GPU Q2_K 量化**: Q2_K 量化全程在 GPU 上完成（torch 向量化），数据不离开 GPU
+- **双缓冲流水线**: CPU 加载与 GPU 量化并行，CUDA stream 异步操作
+- **动态 batch size**: 根据权重形状自动调整，防止 VRAM OOM
+- **增量写入**: 每 10 个 shard 保存一次，避免内存爆炸（33792 专家权重 ~80GB）
+- **imatrix 支持**: 加载 llama.cpp 格式的 .dat importance weights 文件
+- **性能**: 30 e/s (RTX 5060 Ti 16GB)，VRAM 仅 2.1GB
+
+#### 校准数据生成 (inference/generate_imatrix.py)
+
+- 从校准数据生成 importance weights 用于 IQ 量化
+- 支持 dummy imatrix（全 1）用于无校准数据场景
+- 输出 .npz 格式
+
+#### GGUF 格式扩展 (inference/gguf_iq2xs.py)
+
+- 新增 `add_iq2xxs_tensor()`: IQ2_XXS 张量写入 (66 bytes/block)
+- 新增 `add_q2k_tensor()`: Q2_K 张量写入 (84 bytes/block)
+- GGML 类型: IQ2_XXS=16, Q2_K=10
+
+#### TileLang GEMM kernel (tilelang/mixed_quant_gemm.py)
+
+- `iq2xxs_gemm_kernel`: IQ2_XXS 反量化 + GEMM (TileLang)
+- `q2k_gemm_kernel`: Q2_K 反量化 + GEMM (TileLang)
+- `mixed_quant_ffn`: 融合 SwiGLU FFN (gate/up IQ2_XXS, down Q2_K)
+
+#### Rust GGUF 读取 (src/gguf.rs)
+
+- 修正 Q2_K `bytes_per_block`: 256 → 84
+
 ## [0.9.5] - 2025-05-23
 
 ### CPU 专家推理 + 混合推理架构

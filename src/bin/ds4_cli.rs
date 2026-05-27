@@ -4,7 +4,6 @@ use ds4rs::generate::{GenerateConfig, Generator};
 use ds4rs::tokenizer::{ChatMessage, Tokenizer, encode_chat, parse_assistant_response};
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Instant;
 
 const MODEL_DIR: &str = "/models";
 
@@ -122,9 +121,6 @@ fn main() -> Result<()> {
 
         eprintln!("[prefill {} tokens, generating ...]", prompt_tokens.len());
 
-        // 计时：测量生成速度 (tokens/s)
-        let gen_start = Instant::now();
-
         // 流式回调：逐 token 输出并计数
         let callback = |text: &str| {
             print!("{}", text);
@@ -132,18 +128,17 @@ fn main() -> Result<()> {
         };
 
         match generator.generate(&prompt_tokens, Some(&callback)) {
-            Ok(completion_tokens) => {
-                let gen_elapsed = gen_start.elapsed();
-                // 计算生成 token 数（不含 prompt）
+            Ok((completion_tokens, stats)) => {
                 let token_count = completion_tokens.len() - prompt_tokens.len();
-                let tokens_per_sec = token_count as f64 / gen_elapsed.as_secs_f64();
 
                 println!();
                 eprintln!(
-                    "\n[stats] {} tokens in {:.2}s → {:.1} t/s",
-                    token_count,
-                    gen_elapsed.as_secs_f64(),
-                    tokens_per_sec
+                    "\n[stats] {} tokens in {:.2}s → {:.1} t/s | GPU peak: {:.0}MB | CPU peak: {:.0}MB",
+                    stats.total_tokens,
+                    stats.elapsed_sec,
+                    stats.tokens_per_sec,
+                    stats.gpu_peak_mb,
+                    stats.cpu_peak_mb
                 );
 
                 // 解码助手回复并加入对话历史

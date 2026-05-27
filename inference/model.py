@@ -1073,7 +1073,7 @@ class MoE(nn.Module):
         expert_weights = {}
         for i in activated:
             expert = self.experts[i]
-            if expert is None:
+            if expert is None and self._cpu_expert_runner is None:
                 continue
             idx, top = torch.where(indices == i)
             expert_inputs[i] = (x[idx], idx, top)
@@ -1081,6 +1081,8 @@ class MoE(nn.Module):
         # 逐专家计算：GPU 命中走 GPU，未命中走 CPU（混合推理）
         gpu_count = 0
         cpu_count = 0
+        cpu_expert_ids = []  # 收集需要 CPU 计算的专家
+
         for i in expert_inputs:
             expert = self.experts[i]
             xi, idx, top = expert_inputs[i]
@@ -1090,15 +1092,22 @@ class MoE(nn.Module):
                 y[idx] += expert(xi, weights[idx, top, None])
                 gpu_count += 1
             else:
-                # CPU 路径：专家权重不在 GPU 缓存中，走 CPU 推理
+                # CPU 路径：收集待计算的专家，稍后批量处理
                 if self._cpu_expert_runner is not None:
-                    for k in range(xi.shape[0]):
-                        cpu_out = self._cpu_expert_runner.compute_expert_cpu(
-                            self.layer_id, i, xi[k], route_weight=weights[idx[k], top[k], 0].item(),
-                            swiglu_limit=self._expert_swiglu_limit
-                        )
-                        y[idx[k]] += cpu_out
+                    cpu_expert_ids.append(i)
                     cpu_count += 1
+
+        # 批量 CPU FFN：一次性传输所有 CPU 专家的输入，并行计算
+        if cpu_expert_ids and self._cpu_expert_runner is not None:
+            for i in cpu_expert_ids:
+                xi, idx, top = expert_inputs[i]
+                for k in range(xi.shape[0]):
+                    rw = weights[idx[k], top[k]].item() if weights.dim() == 2 else weights[idx[k], top[k], 0].item()
+                    cpu_out = self._cpu_expert_runner.compute_expert_cpu(
+                        self.layer_id, i, xi[k], route_weight=rw,
+                        swiglu_limit=self._expert_swiglu_limit
+                    )
+                    y[idx[k]] += cpu_out
                 # else: 无 CPU 推理能力，跳过（输出为 0）
 
         # 混合推理统计（每 10 层打印一次）

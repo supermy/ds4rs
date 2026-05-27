@@ -63,16 +63,9 @@ class ExpertIndex:
     offset: int
 
 class IQ2XSArchiveWriter:
-    """IQ2_XS 归档写入器 — 将所有专家打包到单个文件"""
+    """IQ2_XS 归档写入器 — 增量写入，避免内存爆炸"""
     
     def __init__(self, filepath: str, n_layers: int, n_experts: int, n_weights: int = 3):
-        """
-        参数:
-            filepath: 输出文件路径
-            n_layers: 层数
-            n_experts: 每层专家数
-            n_weights: 每专家权重数（默认 3 = w1/w2/w3）
-        """
         self.filepath = filepath
         self.n_layers = n_layers
         self.n_experts = n_experts
@@ -81,10 +74,17 @@ class IQ2XSArchiveWriter:
         # 索引表
         self.index: List[ExpertIndex] = []
         
-        # 数据缓冲
-        self.data_buffers: List[bytes] = []
+        # 增量写入：直接写数据到文件，不在内存中累积
         self.current_offset = 0
-        
+        self._data_file = None  # 延迟打开
+        self._data_filepath = filepath + ".data.tmp"
+    
+    def _ensure_data_file(self):
+        """确保数据临时文件已打开。"""
+        if self._data_file is None:
+            os.makedirs(os.path.dirname(self._data_filepath) or ".", exist_ok=True)
+            self._data_file = open(self._data_filepath, 'wb')
+    
     def add_expert(
         self,
         layer_id: int,
@@ -96,24 +96,7 @@ class IQ2XSArchiveWriter:
         out_dim: int,
         in_dim: int,
     ) -> None:
-        """
-        添加一个专家权重到归档。
-        
-        参数:
-            layer_id: 层 ID
-            expert_id: 专家 ID
-            weight_type: 权重类型 (0=w1, 1=w2, 2=w3)
-            d: float16 数组，形状 [n_blocks]
-            qs: uint16 数组，形状 [n_blocks, 32]
-            scales: uint8 数组，形状 [n_blocks, 8]
-            out_dim: 输出维度
-            in_dim: 输入维度
-        """
         n_blocks = d.shape[0]
-
-        # v2 分离存储: d + qs + scales 各自连续存储
-        # 优势: 读取时 np.frombuffer 可直接创建连续视图，无需 .copy()
-        # 总大小与 v1 交织存储相同: n_blocks * (2 + 64 + 8) = n_blocks * 74B
         d_data = d.astype(np.float16).ravel().tobytes()
         qs_data = qs.astype(np.uint16).reshape(n_blocks, 32).tobytes()
         scales_data = scales.astype(np.uint8).reshape(n_blocks, 8).tobytes()
@@ -130,18 +113,22 @@ class IQ2XSArchiveWriter:
             offset=self.current_offset,
         ))
         
-        self.data_buffers.append(data)
+        # 增量写入数据到临时文件
+        self._ensure_data_file()
+        self._data_file.write(data)
         self.current_offset += len(data)
     
     def write(self) -> None:
-        """写入归档文件"""
-        # 计算偏移
+        """写入归档文件（合并索引 + 数据）"""
+        # 关闭数据临时文件
+        if self._data_file is not None:
+            self._data_file.close()
+        
         n_entries = len(self.index)
         index_offset = HEADER_SIZE
         index_size = n_entries * INDEX_ENTRY_SIZE
         data_offset = index_offset + index_size
         
-        # 写入文件
         with open(self.filepath, 'wb') as f:
             # 文件头
             f.write(MAGIC)
@@ -152,7 +139,7 @@ class IQ2XSArchiveWriter:
             f.write(struct.pack('<Q', index_offset))
             f.write(struct.pack('<Q', index_size))
             f.write(struct.pack('<Q', data_offset))
-            f.write(b'\x00' * 20)  # reserved (64 - 44 = 20)
+            f.write(b'\x00' * 20)
             
             # 索引表
             for entry in self.index:
@@ -160,9 +147,15 @@ class IQ2XSArchiveWriter:
                 f.write(struct.pack('<III', entry.n_blocks, entry.out_dim, entry.in_dim))
                 f.write(struct.pack('<Q', data_offset + entry.offset))
             
-            # 数据区
-            for data in self.data_buffers:
-                f.write(data)
+            # 数据区：从临时文件拷贝
+            if os.path.exists(self._data_filepath):
+                with open(self._data_filepath, 'rb') as df:
+                    while True:
+                        chunk = df.read(64 * 1024 * 1024)  # 64MB chunks
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                os.remove(self._data_filepath)
         
         total_size = os.path.getsize(self.filepath)
         print(f"[IQ2XSArchive] 写入完成: {self.filepath}")

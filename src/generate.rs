@@ -1,6 +1,22 @@
 use crate::model::Transformer;
 use crate::tokenizer::Tokenizer;
 use anyhow::Result;
+use std::time::Instant;
+
+/// 推理统计信息
+#[derive(Debug, Clone, Default)]
+pub struct InferenceStats {
+    /// 生成 token 数（不含 prompt）
+    pub total_tokens: usize,
+    /// 生成耗时（秒）
+    pub elapsed_sec: f64,
+    /// 每秒生成 token 数
+    pub tokens_per_sec: f64,
+    /// GPU 显存峰值（MB）
+    pub gpu_peak_mb: f64,
+    /// CPU 内存峰值（MB）
+    pub cpu_peak_mb: f64,
+}
 
 /// 自回归生成配置
 pub struct GenerateConfig {
@@ -64,11 +80,16 @@ impl Generator {
     /// 1. Prefill：一次性前向传播全部 prompt tokens
     /// 2. Decode：逐 token 前向传播 + 采样，直到 EOS 或达到最大长度
     /// callback 用于流式输出每个新生成的 token
+    /// 返回 (completion_tokens, stats) 元组
     pub fn generate(
         &mut self,
         prompt_tokens: &[u32],
         callback: Option<&dyn Fn(&str)>,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<(Vec<u32>, InferenceStats)> {
+        let gen_start = Instant::now();
+        let gpu_start_mb = self.get_gpu_memory_mb().unwrap_or(0.0);
+        let cpu_start_kb = Self::get_cpu_memory_kb();
+
         let eos_id = self.tokenizer.eos_id();
         let prompt_len = prompt_tokens.len();
         let max_len = prompt_len + self.config.max_new_tokens;
@@ -94,7 +115,8 @@ impl Generator {
 
         if next_token == eos_id {
             all_tokens.push(next_token);
-            return Ok(all_tokens);
+            let stats = self.compute_stats(&gen_start, gpu_start_mb, cpu_start_kb, 1);
+            return Ok((all_tokens, stats));
         }
 
         all_tokens.push(next_token);
@@ -125,7 +147,62 @@ impl Generator {
             }
         }
 
-        Ok(all_tokens)
+        let total_tokens = all_tokens.len() - prompt_len;
+        let stats = self.compute_stats(&gen_start, gpu_start_mb, cpu_start_kb, total_tokens);
+        Ok((all_tokens, stats))
+    }
+
+    /// 计算推理统计信息
+    fn compute_stats(&self, start: &Instant, gpu_start_mb: f64, cpu_start_kb: i64, total_tokens: usize) -> InferenceStats {
+        let elapsed = start.elapsed().as_secs_f64();
+        let tokens_per_sec = if elapsed > 0.0 { total_tokens as f64 / elapsed } else { 0.0 };
+        
+        let gpu_peak_mb = self.get_gpu_memory_mb().unwrap_or(gpu_start_mb);
+        let cpu_peak_kb = Self::get_cpu_memory_kb();
+        let cpu_peak_mb = if cpu_peak_kb > cpu_start_kb { (cpu_peak_kb - cpu_start_kb) as f64 / 1024.0 } else { 0.0 };
+
+        InferenceStats {
+            total_tokens,
+            elapsed_sec: elapsed,
+            tokens_per_sec,
+            gpu_peak_mb,
+            cpu_peak_mb,
+        }
+    }
+
+    /// 获取当前 GPU 显存使用量（MB）
+    fn get_gpu_memory_mb(&self) -> Option<f64> {
+        unsafe {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            let result = cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize);
+            if result == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                let used = total - free;
+                return Some(used as f64 / (1024.0 * 1024.0));
+            }
+        }
+        None
+    }
+
+    /// 获取当前进程 CPU 内存使用量（KB）
+    fn get_cpu_memory_kb() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            use std::fs;
+            if let Ok(status) = fs::read_to_string("/proc/self/status") {
+                for line in status.lines() {
+                    if line.starts_with("VmRSS:") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(kb) = parts[1].parse::<i64>() {
+                                return kb;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        0
     }
 
     /// 从 logits 中采样一个 token
